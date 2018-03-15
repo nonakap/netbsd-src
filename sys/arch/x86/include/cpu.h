@@ -519,6 +519,8 @@ void	startrtclock(void);
 void	i8254_delay(unsigned int);
 void	i8254_microtime(struct timeval *);
 void	i8254_initclocks(void);
+unsigned int gettick(void);
+extern void (*x86_delay)(unsigned int);
 
 /* cpu.c */
 void	cpu_probe_features(struct cpu_info *);
