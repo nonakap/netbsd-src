@@ -84,6 +84,7 @@ __KERNEL_RCSID(0, "$NetBSD: pci_machdep.c,v 1.86 2019/05/24 14:28:48 nonaka Exp 
 #include <sys/bus.h>
 #include <sys/cpu.h>
 #include <sys/kmem.h>
+#include <sys/efi.h>
 
 #include <uvm/uvm_extern.h>
 
