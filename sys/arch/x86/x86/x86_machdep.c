@@ -1182,6 +1182,32 @@ sysctl_machdep_tsc_enable(SYSCTLFN_ARGS)
 }
 #endif
 
+static const char * const vm_guest_name[VM_LAST] = {
+	[VM_GUEST_NO] =		"none",
+	[VM_GUEST_VM] =		"generic",
+	[VM_GUEST_XEN] =	"Xen",
+	[VM_GUEST_HV] =		"Hyper-V",
+	[VM_GUEST_VMWARE] =	"VMware",
+	[VM_GUEST_KVM] =	"KVM",
+};
+
+static int
+sysctl_machdep_hypervisor(SYSCTLFN_ARGS)
+{
+	struct sysctlnode node;
+	const char *t = NULL;
+	char buf[8];
+
+	node = *rnode;
+	node.sysctl_data = buf;
+	if (vm_guest >= VM_GUEST_NO && vm_guest < VM_LAST)
+		t = vm_guest_name[vm_guest];
+	if (t == NULL)
+		t = "unknown";
+	strlcpy(buf, t, sizeof(buf));
+	return sysctl_lookup(SYSCTLFN_CALL(&node));
+}
+
 static void
 const_sysctl(struct sysctllog **clog, const char *name, int type,
     u_quad_t value, int tag)
@@ -1255,6 +1281,11 @@ SYSCTL_SETUP(sysctl_machdep_setup, "sysctl machdep subtree setup")
 		       sysctl_machdep_tsc_enable, 0, &tsc_user_enabled, 0,
 		       CTL_MACHDEP, CTL_CREATE, CTL_EOL);
 #endif
+	sysctl_createv(clog, 0, NULL, NULL,
+		       CTLFLAG_PERMANENT,
+		       CTLTYPE_STRING, "hypervisor", NULL,
+		       sysctl_machdep_hypervisor, 0, NULL, 0,
+		       CTL_MACHDEP, CTL_CREATE, CTL_EOL);
 #ifdef SVS
 	int sysctl_machdep_svs_enabled(SYSCTLFN_ARGS);
 	const struct sysctlnode *svs_rnode = NULL;
