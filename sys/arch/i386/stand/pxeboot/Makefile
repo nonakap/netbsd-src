@@ -15,9 +15,6 @@ RELOC=		0x0
 
 SRCS= main.c dev_net.c devopen.c conf.c 
 SRCS+=exec.c exec_multiboot1.c exec_multiboot2.c pxe.c pxe_call.S
-# use our own nfs implementation
-.PATH: ${.CURDIR}/../libsa
-SRCS+= nfs.c
 
 .include <bsd.init.mk>
 
@@ -55,6 +52,7 @@ CPPFLAGS+= -DSUPPORT_BOOTP -DSUPPORT_DHCP
 CPPFLAGS+= -DSUPPORT_TFTP
 CPPFLAGS+= -DSUPPORT_NFS
 #CPPFLAGS+= -DNFS_NOSYMLINK
+CPPFLAGS+= -DNFS_MOUNT_WHEN_OPEN
 
 CPPFLAGS+= -DPASS_MEMMAP
 CPPFLAGS+= -DEPIA_HACK
