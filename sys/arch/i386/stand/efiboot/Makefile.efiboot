@@ -18,9 +18,7 @@ SOURCES+= efidisk.c efidisk_ll.c efigetsecs.c efimemory.c
 SOURCES+= efinet.c efipxe.c
 LIBI386SRCS= biosdisk.c bootinfo.c bootinfo_biosgeom.c bootmenu.c
 LIBI386SRCS+= diskbuf.c exec.c menuutils.c parseutils.c pread.c
-# use our own nfs implementation
-LIBSASRCS+= nfs.c
-SRCS= ${SOURCES} ${EXTRA_SOURCES} ${LIBI386SRCS} ${LIBSASRCS}
+SRCS= ${SOURCES} ${EXTRA_SOURCES} ${LIBI386SRCS}
 
 .include <bsd.init.mk>
 
