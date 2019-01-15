@@ -325,15 +325,13 @@ hvs_match(device_t parent, cfdata_t cf, void *aux)
 static void
 hvs_attach(device_t parent, device_t self, void *aux)
 {
+	extern struct cfdata cfdata[];
 	struct hvs_softc *sc = device_private(self);
 	struct vmbus_attach_args *aa = aux;
 	struct scsipi_adapter *adapt = &sc->sc_adapter;
 	struct scsipi_channel *chan = &sc->sc_channel;
 	const char *bus;
 	bool is_scsi;
-#if 0	/* XXX pciide_skip_ata */
-	extern int pciide_skip_ata;
-#endif
 
 	sc->sc_dev = self;
 	sc->sc_chan = aa->aa_chan;
@@ -398,15 +396,34 @@ hvs_attach(device_t parent, device_t self, void *aux)
 	sc->sc_scsibus = config_found(self, &sc->sc_channel, scsiprint);
 
 	/*
-	 * If the driver has successfully attached to an IDE
-	 * device, we need to make sure that the same disk is
-	 * not available to the system via pciide(4) causing
-	 * DUID conflicts and preventing system from booting.
+	 * If the driver has successfully attached to an IDE device,
+	 * we need to make sure that the same disk is not available to
+	 * the system via pciide(4) or piixide(4) causing DUID conflicts
+	 * and preventing system from booting.
 	 */
-#if 0	/* XXX pciide_skip_ata */
-	if (!is_scsi && sc->sc_scsibus != NULL)
-		pciide_skip_ata = 1;
-#endif
+	if (!is_scsi && sc->sc_scsibus != NULL) {
+		static const char *disable_devices[] = {
+			"wd",
+		};
+		size_t j;
+
+		for (j = 0; j < __arraycount(disable_devices); j++) {
+			const char *dev = disable_devices[j];
+			size_t len = strlen(dev);
+			int devno;
+
+			for (devno = 0; cfdata[devno].cf_name != NULL; devno++) {
+				cfdata_t cf = &cfdata[devno];
+
+				if (strlen(cf->cf_name) != len ||
+				    strncasecmp(dev, cf->cf_name, len) != 0 ||
+				    cf->cf_fstate != FSTATE_STAR)
+					continue;
+
+				cf->cf_fstate = FSTATE_DSTAR;
+			}
+		}
+	}
 }
 
 static int
