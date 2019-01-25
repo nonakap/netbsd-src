@@ -33,6 +33,7 @@ __KERNEL_RCSID(0, "$NetBSD: nvme.c,v 1.69 2024/03/11 21:10:46 riastradh Exp $");
 #include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/mutex.h>
+#include <sys/sysctl.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -47,6 +48,16 @@ __KERNEL_RCSID(0, "$NetBSD: nvme.c,v 1.69 2024/03/11 21:10:46 riastradh Exp $");
 
 int nvme_adminq_size = 32;
 int nvme_ioq_size = 1024;
+
+/*
+ * HMB allocation policy:
+ *
+ * >0: fixed size (in KiB)
+ *  0: HMB is not used
+ * -1: use minimum size
+ * -2: use preferred size
+ */
+int nvme_hmb_max_size = -1;
 
 static int	nvme_print(void *, const char *);
 
@@ -116,6 +127,9 @@ static void	nvme_q_free(struct nvme_softc *, struct nvme_queue *);
 static void	nvme_q_wait_complete(struct nvme_softc *, struct nvme_queue *,
 		    bool (*)(void *), void *);
 
+static struct nvme_dmamem *
+		nvme_dmamem_alloc1(struct nvme_softc *, size_t, int);
+
 static void	nvme_ns_io_fill(struct nvme_queue *, struct nvme_ccb *,
 		    void *);
 static void	nvme_ns_io_done(struct nvme_queue *, struct nvme_ccb *,
@@ -139,10 +153,14 @@ static int	nvme_command_passthrough(struct nvme_softc *,
 static int	nvme_set_number_of_queues(struct nvme_softc *, u_int, u_int *,
 		    u_int *);
 
+static int	nvme_init_host_memory_buffer(struct nvme_softc *);
+static void	nvme_free_host_memory_buffer(struct nvme_softc *);
+
 #define NVME_TIMO_QOP		5	/* queue create and delete timeout */
 #define NVME_TIMO_IDENT		10	/* probe identify timeout */
 #define NVME_TIMO_PT		-1	/* passthrough cmd timeout */
 #define NVME_TIMO_SY		60	/* sync cache timeout */
+#define NVME_TIMO_HMB		5	/* set host memory buffer timeout */
 
 /*
  * Some controllers, at least Apple NVMe, always require split
@@ -432,12 +450,15 @@ nvme_attach(struct nvme_softc *sc)
 	nvme_ccbs_free(sc->sc_admin_q);
 	nvme_ccbs_alloc(sc->sc_admin_q, sc->sc_admin_q->q_entries);
 
+	if (sc->sc_identify.hmpre > 0)
+		nvme_init_host_memory_buffer(sc);
+
 	if (sc->sc_use_mq) {
 		/* Limit the number of queues to the number allocated in HW */
 		if (nvme_set_number_of_queues(sc, sc->sc_nq, &ncq, &nsq) != 0) {
 			aprint_error_dev(sc->sc_dev,
 			    "unable to get number of queues\n");
-			goto disable;
+			goto free_hmb;
 		}
 		if (sc->sc_nq > ncq)
 			sc->sc_nq = ncq;
@@ -477,6 +498,9 @@ free_q:
 		nvme_q_delete(sc, sc->sc_q[i]);
 		nvme_q_free(sc, sc->sc_q[i]);
 	}
+free_hmb:
+	if (sc->sc_identify.hmpre > 0)
+		nvme_free_host_memory_buffer(sc);
 disable:
 	nvme_disable(sc);
 disestablish_admin_q:
@@ -573,6 +597,9 @@ nvme_detach(struct nvme_softc *sc, int flags)
 	error = nvme_shutdown(sc);
 	if (error)
 		return error;
+
+	if (sc->sc_identify.hmpre > 0)
+		nvme_free_host_memory_buffer(sc);
 
 	/* from now on we are committed to detach, following will never fail */
 	for (i = 0; i < sc->sc_nq; i++)
@@ -1150,6 +1177,48 @@ nvme_admin_setcache(struct nvme_softc *sc, int dkcache)
 		error = 0;
 	else
 		error = EINVAL;
+
+	return error;
+}
+
+/*
+ * Set host memory buffer.
+ */
+static int
+nvme_admin_set_host_memory_buffer(struct nvme_softc *sc, uint32_t cdw11)
+{
+	struct nvme_sqe sqe;
+	struct nvme_ccb *ccb;
+	uint64_t daddr;
+	int error;
+
+	if (sc->sc_identify.hmpre == 0)
+		return EOPNOTSUPP;
+
+	if (sc->sc_hmb == NULL ||
+	    sc->sc_hmb_descr == NULL ||
+	    sc->sc_hmb_npg == 0)
+		return EINVAL;
+
+	ccb = nvme_ccb_get(sc->sc_admin_q, false);
+	KASSERT(ccb != NULL);
+
+	ccb->ccb_done = nvme_empty_done;
+	ccb->ccb_cookie = &sqe;
+
+	memset(&sqe, 0, sizeof(sqe));
+	sqe.opcode = NVM_ADMIN_SET_FEATURES;
+	htolem32(&sqe.cdw10, NVM_FEAT_HOST_MEMORY_BUFFER);
+	htolem32(&sqe.cdw11, cdw11);
+	htolem32(&sqe.cdw12, sc->sc_hmb_npg);
+	daddr = NVME_DMA_DVA(sc->sc_hmb_descr);
+	htolem32(&sqe.cdw13, (uint32_t)daddr);
+	htolem32(&sqe.cdw14, (uint32_t)(daddr >> 32));
+	htolem32(&sqe.cdw15, NVME_DMA_MAP(sc->sc_hmb)->dm_nsegs);
+
+	error = nvme_poll(sc, sc->sc_admin_q, ccb, nvme_sqe_fill, NVME_TIMO_HMB);
+
+	nvme_ccb_put(sc->sc_admin_q, ccb);
 
 	return error;
 }
@@ -2025,6 +2094,133 @@ nvme_q_free(struct nvme_softc *sc, struct nvme_queue *q)
 	kmem_free(q, sizeof(*q));
 }
 
+static int
+nvme_init_host_memory_buffer(struct nvme_softc *sc)
+{
+	char buf[32];
+	bus_dmamap_t dmap;
+	struct nvme_hmb_descr_entry *descr;
+	uint64_t preferredsz, minsz, maxsz, size;
+	uint32_t cdw11 = NVM_HOST_MEMORY_BUFFER_EHM;
+	uint32_t max_npg, npg = 0;
+	int i, error;
+
+	preferredsz = (uint64_t)sc->sc_identify.hmpre * 4096;
+	minsz = (uint64_t)sc->sc_identify.hmmin * 4096;
+
+	if (nvme_hmb_max_size == 0) {
+		/* HMB is not used. */
+		aprint_normal_dev(sc->sc_dev, "HMB: not used\n");
+		nvme_free_host_memory_buffer(sc);
+		return 0;
+	} else if (nvme_hmb_max_size > 0) {
+		/* Limit the memory used by HMB. */
+		maxsz = (uint64_t)nvme_hmb_max_size * 1024;
+		format_bytes(buf, sizeof(buf), maxsz);
+		aprint_verbose_dev(sc->sc_dev,
+		    "HMB: specified size: %s\n", buf);
+		if (minsz > maxsz) {
+			aprint_normal_dev(sc->sc_dev, "HMB: not used\n");
+			nvme_free_host_memory_buffer(sc);
+			return 0;
+		}
+		size = MIN(preferredsz, maxsz);
+		format_bytes(buf, sizeof(buf), size);
+		aprint_verbose_dev(sc->sc_dev, "HMB: using %s size: %s\n",
+		    preferredsz < maxsz ? "preferred" : "specified", buf);
+	} else if (nvme_hmb_max_size == -1) {
+		size = minsz;
+		format_bytes(buf, sizeof(buf), size);
+		aprint_verbose_dev(sc->sc_dev,
+		    "HMB: using minimum size: %s\n", buf);
+	} else if (nvme_hmb_max_size == -2) {
+		size = preferredsz;
+		format_bytes(buf, sizeof(buf), size);
+		aprint_verbose_dev(sc->sc_dev,
+		    "HMB: using preferred size: %s\n", buf);
+	} else {
+		aprint_error_dev(sc->sc_dev,
+		    "invalid HMB allocation policy: %d\n", nvme_hmb_max_size);
+		nvme_free_host_memory_buffer(sc);
+		return 0;
+	}
+
+	if (sc->sc_hmb != NULL) {
+		if (sc->sc_hmb->ndm_size >= size) {
+			/* Reuse the current buffer. */
+			cdw11 |= NVM_HOST_MEMORY_BUFFER_MR;
+			npg = sc->sc_hmb_npg;
+		} else {
+			nvme_free_host_memory_buffer(sc);
+		}
+	}
+	if (sc->sc_hmb == NULL) {
+		max_npg = howmany(size, sc->sc_mps);
+		aprint_verbose_dev(sc->sc_dev, "HMB: max pages: %u\n", max_npg);
+		for (npg = 1; npg < max_npg; npg++) {
+			sc->sc_hmb = nvme_dmamem_alloc1(sc, size, npg);
+			if (sc->sc_hmb != NULL)
+				break;
+		}
+		if (sc->sc_hmb == NULL) {
+			aprint_error_dev(sc->sc_dev,
+			    "HBM: failed to allocate\n");
+			nvme_free_host_memory_buffer(sc);
+			return 0;
+		}
+
+		nvme_dmamem_sync(sc, sc->sc_hmb, BUS_DMASYNC_PREWRITE);
+
+		dmap = NVME_DMA_MAP(sc->sc_hmb);
+		sc->sc_hmb_descr = nvme_dmamem_alloc(sc,
+		    sizeof(struct nvme_hmb_descr_entry) * dmap->dm_nsegs);
+		if (sc->sc_hmb_descr == NULL) {
+			aprint_error_dev(sc->sc_dev,
+			    "HBM: failed to allocate HMB descriptor list\n");
+			nvme_free_host_memory_buffer(sc);
+			return 0;
+		}
+
+		/* Make a HMB descriptor list. */
+		descr = NVME_DMA_KVA(sc->sc_hmb_descr);
+		for (i = 0; i < dmap->dm_nsegs; i++) {
+			htolem64(&descr[i].badd,
+			    (uint64_t)(dmap->dm_segs[i].ds_addr));
+			htolem32(&descr[i].bsize,
+			    dmap->dm_segs[i].ds_len / sc->sc_mps);
+		}
+		nvme_dmamem_sync(sc, sc->sc_hmb_descr, BUS_DMASYNC_PREWRITE);
+	}
+
+	sc->sc_hmb_npg = npg;
+	error = nvme_admin_set_host_memory_buffer(sc, cdw11);
+	if (error) {
+		aprint_error_dev(sc->sc_dev, "failed to set HMB feature\n");
+		nvme_free_host_memory_buffer(sc);
+		return 0;
+	}
+
+	format_bytes(buf, sizeof(buf), size);
+	aprint_normal_dev(sc->sc_dev, "HBM: using %s\n", buf);
+
+	return 0;
+}
+
+static void
+nvme_free_host_memory_buffer(struct nvme_softc *sc)
+{
+
+	if (sc->sc_hmb != NULL) {
+		nvme_dmamem_free(sc, sc->sc_hmb);
+		sc->sc_hmb = NULL;
+	}
+	if (sc->sc_hmb_descr != NULL) {
+		nvme_dmamem_free(sc, sc->sc_hmb_descr);
+		sc->sc_hmb_descr = NULL;
+	}
+	sc->sc_hmb_npg = 0;
+}
+
 int
 nvme_intr(void *xsc)
 {
@@ -2095,48 +2291,72 @@ nvme_softintr_msi(void *xq)
 	nvme_q_complete(sc, q);
 }
 
-struct nvme_dmamem *
-nvme_dmamem_alloc(struct nvme_softc *sc, size_t size)
+static struct nvme_dmamem *
+nvme_dmamem_alloc1(struct nvme_softc *sc, size_t size, int nsegs)
 {
 	struct nvme_dmamem *ndm;
-	int nsegs;
+	int rsegs, error;
 
 	ndm = kmem_zalloc(sizeof(*ndm), KM_SLEEP);
-	if (ndm == NULL)
-		return NULL;
-
+	ndm->ndm_segs = kmem_zalloc(sizeof(*ndm->ndm_segs) * nsegs,
+	    KM_SLEEP);
 	ndm->ndm_size = size;
+	ndm->ndm_nsegs = nsegs;
 
-	if (bus_dmamap_create(sc->sc_dmat, size, btoc(round_page(size)), size, 0,
-	    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &ndm->ndm_map) != 0)
+	error = bus_dmamem_alloc(sc->sc_dmat, size, sc->sc_mps, 0,
+	    ndm->ndm_segs, nsegs, &rsegs, BUS_DMA_WAITOK);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamem_alloc failed: %d\n",
+		    error);
 		goto ndmfree;
+	}
 
-	if (bus_dmamem_alloc(sc->sc_dmat, size, sc->sc_mps, 0, &ndm->ndm_seg,
-	    1, &nsegs, BUS_DMA_WAITOK) != 0)
-		goto destroy;
+	error = bus_dmamem_map(sc->sc_dmat, ndm->ndm_segs, rsegs, size,
+	    &ndm->ndm_kva, BUS_DMA_WAITOK);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamem_map failed: %d\n",
+		    error);
+		goto memfree;
+	}
 
-	if (bus_dmamem_map(sc->sc_dmat, &ndm->ndm_seg, nsegs, size,
-	    &ndm->ndm_kva, BUS_DMA_WAITOK) != 0)
-		goto free;
-
-	if (bus_dmamap_load(sc->sc_dmat, ndm->ndm_map, ndm->ndm_kva, size,
-	    NULL, BUS_DMA_WAITOK) != 0)
+	error = bus_dmamap_create(sc->sc_dmat, size, rsegs, size, 0,
+	    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &ndm->ndm_map);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamap_create failed: %d\n",
+		    error);
 		goto unmap;
+	}
+
+	error = bus_dmamap_load(sc->sc_dmat, ndm->ndm_map, ndm->ndm_kva, size,
+	    NULL, BUS_DMA_WAITOK);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamap_load failed: %d\n",
+		    error);
+		goto destroy;
+	}
 
 	memset(ndm->ndm_kva, 0, size);
-	bus_dmamap_sync(sc->sc_dmat, ndm->ndm_map, 0, size, BUS_DMASYNC_PREREAD);
+	bus_dmamap_sync(sc->sc_dmat, ndm->ndm_map, 0, size,
+	    BUS_DMASYNC_PREREAD);
 
 	return ndm;
 
-unmap:
-	bus_dmamem_unmap(sc->sc_dmat, ndm->ndm_kva, size);
-free:
-	bus_dmamem_free(sc->sc_dmat, &ndm->ndm_seg, 1);
 destroy:
 	bus_dmamap_destroy(sc->sc_dmat, ndm->ndm_map);
+unmap:
+	bus_dmamem_unmap(sc->sc_dmat, ndm->ndm_kva, size);
+memfree:
+	bus_dmamem_free(sc->sc_dmat, ndm->ndm_segs, rsegs);
 ndmfree:
+	kmem_free(ndm->ndm_segs, sizeof(*ndm->ndm_segs) * nsegs);
 	kmem_free(ndm, sizeof(*ndm));
 	return NULL;
+}
+
+struct nvme_dmamem *
+nvme_dmamem_alloc(struct nvme_softc *sc, size_t size)
+{
+	return nvme_dmamem_alloc1(sc, size, 1);
 }
 
 void
@@ -2149,10 +2369,13 @@ nvme_dmamem_sync(struct nvme_softc *sc, struct nvme_dmamem *mem, int ops)
 void
 nvme_dmamem_free(struct nvme_softc *sc, struct nvme_dmamem *ndm)
 {
+	int rsegs = ndm->ndm_map->dm_nsegs;
+
 	bus_dmamap_unload(sc->sc_dmat, ndm->ndm_map);
-	bus_dmamem_unmap(sc->sc_dmat, ndm->ndm_kva, ndm->ndm_size);
-	bus_dmamem_free(sc->sc_dmat, &ndm->ndm_seg, 1);
 	bus_dmamap_destroy(sc->sc_dmat, ndm->ndm_map);
+	bus_dmamem_unmap(sc->sc_dmat, ndm->ndm_kva, ndm->ndm_size);
+	bus_dmamem_free(sc->sc_dmat, ndm->ndm_segs, rsegs);
+	kmem_free(ndm->ndm_segs, sizeof(*ndm->ndm_segs) * ndm->ndm_nsegs);
 	kmem_free(ndm, sizeof(*ndm));
 }
 
@@ -2264,4 +2487,34 @@ nvmeioctl(dev_t dev, u_long cmd, void *data, int flag, struct lwp *l)
 	}
 
 	return ENOTTY;
+}
+
+/*
+ * Setup sysctl(3) MIB, hw.nvme.*
+ */
+SYSCTL_SETUP(sysctl_rtw, "sysctl nvme(4) subtree setup")
+{
+	const struct sysctlnode *cnode, *rnode;
+	int rc;
+
+	if ((rc = sysctl_createv(clog, 0, NULL, &rnode,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE,
+	    "nvme", SYSCTL_DESCR("NVM Express"),
+	    NULL, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL)) != 0)
+		goto err;
+
+	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
+	    CTLFLAG_PERMANENT|CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "hmb_max_size",
+	    SYSCTL_DESCR("The maximum size of Host Memory Buffer: "
+	      ">0: fixed size (in KiB), 0: HMB is not used, "
+	      "-1: use minimum size, -2: use preferred size"),
+	    NULL, 0, &nvme_hmb_max_size, 0,
+	    CTL_CREATE, CTL_EOL)) != 0)
+		goto err;
+
+	return;
+err:
+	printf("%s: sysctl_createv failed (rc = %d)\n", __func__, rc);
 }
