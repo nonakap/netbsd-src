@@ -27,9 +27,10 @@
 
 struct nvme_dmamem {
 	bus_dmamap_t		ndm_map;
-	bus_dma_segment_t	ndm_seg;
+	bus_dma_segment_t	*ndm_segs;
 	size_t			ndm_size;
 	void			*ndm_kva;
+	int			ndm_nsegs;
 };
 #define NVME_DMA_MAP(_ndm)	((_ndm)->ndm_map)
 #define NVME_DMA_LEN(_ndm)	((_ndm)->ndm_map->dm_segs[0].ds_len)
@@ -159,6 +160,10 @@ struct nvme_softc {
 	u_int			sc_nq;		/* # of io queue (sc_q) */
 	struct nvme_queue	*sc_admin_q;
 	struct nvme_queue	**sc_q;
+
+	struct nvme_dmamem	*sc_hmb;
+	struct nvme_dmamem	*sc_hmb_descr;
+	uint32_t		sc_hmb_npg;
 
 	uint32_t		sc_flags;
 #define	NVME_F_ATTACHED	__BIT(0)
