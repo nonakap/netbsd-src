@@ -33,6 +33,7 @@ __KERNEL_RCSID(0, "$NetBSD: nvme.c,v 1.44 2019/06/28 15:08:47 jmcneill Exp $");
 #include <sys/proc.h>
 #include <sys/queue.h>
 #include <sys/mutex.h>
+#include <sys/sysctl.h>
 
 #include <uvm/uvm_extern.h>
 
@@ -46,6 +47,11 @@ __KERNEL_RCSID(0, "$NetBSD: nvme.c,v 1.44 2019/06/28 15:08:47 jmcneill Exp $");
 
 int nvme_adminq_size = 32;
 int nvme_ioq_size = 1024;
+
+#ifndef NVME_HMB_MAX_SIZE
+#define NVME_HMB_MAX_SIZE	128
+#endif
+u_int nvme_hmb_max_size = NVME_HMB_MAX_SIZE;	/* MiB */
 
 static int	nvme_print(void *, const char *);
 
@@ -91,6 +97,8 @@ static void	nvme_q_wait_complete(struct nvme_softc *, struct nvme_queue *,
 		    bool (*)(void *), void *);
 
 static struct nvme_dmamem *
+		nvme_dmamem_alloc1(struct nvme_softc *, size_t, int);
+static struct nvme_dmamem *
 		nvme_dmamem_alloc(struct nvme_softc *, size_t);
 static void	nvme_dmamem_free(struct nvme_softc *, struct nvme_dmamem *);
 static void	nvme_dmamem_sync(struct nvme_softc *, struct nvme_dmamem *,
@@ -118,10 +126,14 @@ static int	nvme_command_passthrough(struct nvme_softc *,
 
 static int	nvme_get_number_of_queues(struct nvme_softc *, u_int *);
 
+static int	nvme_init_host_memory_buffer(struct nvme_softc *);
+static void	nvme_free_host_memory_buffer(struct nvme_softc *);
+
 #define NVME_TIMO_QOP		5	/* queue create and delete timeout */
 #define NVME_TIMO_IDENT		10	/* probe identify timeout */
 #define NVME_TIMO_PT		-1	/* passthrough cmd timeout */
 #define NVME_TIMO_SY		60	/* sync cache timeout */
+#define NVME_TIMO_HMB		5	/* set host memory buffer timeout */
 
 #define nvme_read4(_s, _r) \
 	bus_space_read_4((_s)->sc_iot, (_s)->sc_ioh, (_r))
@@ -407,12 +419,20 @@ nvme_attach(struct nvme_softc *sc)
 	nvme_ccbs_free(sc->sc_admin_q);
 	nvme_ccbs_alloc(sc->sc_admin_q, sc->sc_admin_q->q_entries);
 
+	if (sc->sc_identify.hmpre > 0) {
+		if (nvme_init_host_memory_buffer(sc) != 0) {
+			aprint_error_dev(sc->sc_dev,
+			    "unable to setup host memory buffer\n");
+			goto disable;
+		}
+	}
+
 	if (sc->sc_use_mq) {
 		/* Limit the number of queues to the number allocated in HW */
 		if (nvme_get_number_of_queues(sc, &ioq_allocated) != 0) {
 			aprint_error_dev(sc->sc_dev,
 			    "unable to get number of queues\n");
-			goto disable;
+			goto free_hmb;
 		}
 		if (sc->sc_nq > ioq_allocated)
 			sc->sc_nq = ioq_allocated;
@@ -449,6 +469,9 @@ free_q:
 		nvme_q_delete(sc, sc->sc_q[i]);
 		nvme_q_free(sc, sc->sc_q[i]);
 	}
+free_hmb:
+	if (sc->sc_identify.hmpre > 0)
+		nvme_free_host_memory_buffer(sc);
 disable:
 	nvme_disable(sc);
 disestablish_admin_q:
@@ -512,6 +535,9 @@ nvme_detach(struct nvme_softc *sc, int flags)
 	error = nvme_shutdown(sc);
 	if (error)
 		return error;
+
+	if (sc->sc_identify.hmpre > 0)
+		nvme_free_host_memory_buffer(sc);
 
 	/* from now on we are committed to detach, following will never fail */
 	for (i = 0; i < sc->sc_nq; i++)
@@ -1033,6 +1059,48 @@ nvme_admin_setcache(struct nvme_softc *sc, int dkcache)
 		error = 0;
 	else
 		error = EINVAL;
+
+	return error;
+}
+
+/*
+ * Set host memory buffer.
+ */
+static int
+nvme_admin_set_host_memory_buffer(struct nvme_softc *sc, uint32_t cdw11)
+{
+	struct nvme_sqe sqe;
+	struct nvme_ccb *ccb;
+	uint64_t daddr;
+	int error;
+
+	if (sc->sc_identify.hmpre == 0)
+		return EOPNOTSUPP;
+
+	if (sc->sc_hmb == NULL ||
+	    sc->sc_hmb_descr == NULL ||
+	    sc->sc_hmb_npg == 0)
+		return EINVAL;
+
+	ccb = nvme_ccb_get(sc->sc_admin_q, false);
+	KASSERT(ccb != NULL);
+
+	ccb->ccb_done = nvme_empty_done;
+	ccb->ccb_cookie = &sqe;
+
+	memset(&sqe, 0, sizeof(sqe));
+	sqe.opcode = NVM_ADMIN_SET_FEATURES;
+	htolem32(&sqe.cdw10, NVM_FEAT_HOST_MEMORY_BUFFER);
+	htolem32(&sqe.cdw11, cdw11);
+	htolem32(&sqe.cdw12, sc->sc_hmb_npg);
+	daddr = NVME_DMA_DVA(sc->sc_hmb_descr);
+	htolem32(&sqe.cdw13, (uint32_t)daddr);
+	htolem32(&sqe.cdw14, (uint32_t)(daddr >> 32));
+	htolem32(&sqe.cdw15, NVME_DMA_MAP(sc->sc_hmb)->dm_nsegs);
+
+	error = nvme_poll(sc, sc->sc_admin_q, ccb, nvme_sqe_fill, NVME_TIMO_HMB);
+
+	nvme_ccb_put(sc->sc_admin_q, ccb);
 
 	return error;
 }
@@ -1793,6 +1861,102 @@ nvme_q_free(struct nvme_softc *sc, struct nvme_queue *q)
 	kmem_free(q, sizeof(*q));
 }
 
+static int
+nvme_init_host_memory_buffer(struct nvme_softc *sc)
+{
+	char buf[32];
+	bus_dmamap_t dmap;
+	struct nvme_hmb_descr_entry *descr;
+	uint64_t max = (uint64_t)nvme_hmb_max_size * 1024 * 1024;
+	uint64_t preferred = (uint64_t)sc->sc_identify.hmpre * 4096;
+	uint64_t min = (uint64_t)sc->sc_identify.hmmin * 4096;
+	uint64_t size, seg;
+	uint32_t cdw11 = NVM_HOST_MEMORY_BUFFER_EHM;
+	int error;
+
+	if (min > max) {
+		aprint_error_dev(sc->sc_dev,
+		    "min size of HMB buffer exceeded max size: "
+		    "%"PRIu64" > %"PRIu64"\n", min, max);
+		nvme_free_host_memory_buffer(sc);
+		return 0;
+	}
+
+	preferred = MIN(preferred, max);
+	size = preferred;
+
+	if (sc->sc_hmb != NULL) {
+		if (sc->sc_hmb->ndm_size >= preferred) {
+			/* Reuse the current buffer. */
+			cdw11 |= NVM_HOST_MEMORY_BUFFER_MR;
+		} else
+			nvme_free_host_memory_buffer(sc);
+	}
+	if (sc->sc_hmb == NULL) {
+		for (size = preferred; size != 0 && size > min; size /= 2) {
+			uint64_t npg = howmany(size, sc->sc_mps);
+			sc->sc_hmb = nvme_dmamem_alloc1(sc, npg * sc->sc_mps, 
+			    npg > INT_MAX ? INT_MAX : (int)npg);
+			if (sc->sc_hmb != NULL)
+				break;
+		}
+		if (sc->sc_hmb == NULL) {
+			aprint_error_dev(sc->sc_dev,
+			    "failed to allocate HMB buffer\n");
+			return 0;
+		}
+		nvme_dmamem_sync(sc, sc->sc_hmb, BUS_DMASYNC_PREWRITE);
+
+		dmap = NVME_DMA_MAP(sc->sc_hmb);
+		sc->sc_hmb_descr = nvme_dmamem_alloc(sc,
+		    sizeof(struct nvme_hmb_descr_entry) * dmap->dm_nsegs);
+		if (sc->sc_hmb_descr == NULL) {
+			aprint_error_dev(sc->sc_dev,
+			    "failed to allocate HMB descriptor list\n");
+			nvme_free_host_memory_buffer(sc);
+			return 0;
+		}
+
+		/* Make a HMB descriptor list. */
+		descr = NVME_DMA_KVA(sc->sc_hmb_descr);
+		for (seg = 0; seg < dmap->dm_nsegs; seg++) {
+			htolem64(&descr[seg].badd,
+			    (uint64_t)(dmap->dm_segs[seg].ds_addr));
+			htolem32(&descr[seg].bsize,
+			    dmap->dm_segs[seg].ds_len / sc->sc_mps);
+		}
+		nvme_dmamem_sync(sc, sc->sc_hmb_descr, BUS_DMASYNC_PREWRITE);
+	}
+
+	sc->sc_hmb_npg = howmany(size, sc->sc_mps);
+	error = nvme_admin_set_host_memory_buffer(sc, cdw11);
+	if (error) {
+		aprint_error_dev(sc->sc_dev, "failed to set HMB feature\n");
+		nvme_free_host_memory_buffer(sc);
+		return 0;
+	}
+
+	format_bytes(buf, sizeof(buf), size);
+	aprint_normal_dev(sc->sc_dev, "using HMB, %s\n", buf);
+
+	return 0;
+}
+
+static void
+nvme_free_host_memory_buffer(struct nvme_softc *sc)
+{
+
+	if (sc->sc_hmb != NULL) {
+		nvme_dmamem_free(sc, sc->sc_hmb);
+		sc->sc_hmb = NULL;
+	}
+	if (sc->sc_hmb_descr != NULL) {
+		nvme_dmamem_free(sc, sc->sc_hmb_descr);
+		sc->sc_hmb_descr = NULL;
+	}
+	sc->sc_hmb_npg = 0;
+}
+
 int
 nvme_intr(void *xsc)
 {
@@ -1858,7 +2022,7 @@ nvme_softintr_msi(void *xq)
 }
 
 static struct nvme_dmamem *
-nvme_dmamem_alloc(struct nvme_softc *sc, size_t size)
+nvme_dmamem_alloc1(struct nvme_softc *sc, size_t size, int nsegments)
 {
 	struct nvme_dmamem *ndm;
 	int nsegs;
@@ -1869,12 +2033,12 @@ nvme_dmamem_alloc(struct nvme_softc *sc, size_t size)
 
 	ndm->ndm_size = size;
 
-	if (bus_dmamap_create(sc->sc_dmat, size, btoc(round_page(size)), size, 0,
-	    BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &ndm->ndm_map) != 0)
+	if (bus_dmamap_create(sc->sc_dmat, size, btoc(round_page(size)), size,
+	    0, BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &ndm->ndm_map) != 0)
 		goto ndmfree;
 
 	if (bus_dmamem_alloc(sc->sc_dmat, size, sc->sc_mps, 0, &ndm->ndm_seg,
-	    1, &nsegs, BUS_DMA_WAITOK) != 0)
+	    nsegments, &nsegs, BUS_DMA_WAITOK) != 0)
 		goto destroy;
 
 	if (bus_dmamem_map(sc->sc_dmat, &ndm->ndm_seg, nsegs, size,
@@ -1891,12 +2055,18 @@ nvme_dmamem_alloc(struct nvme_softc *sc, size_t size)
 unmap:
 	bus_dmamem_unmap(sc->sc_dmat, ndm->ndm_kva, size);
 free:
-	bus_dmamem_free(sc->sc_dmat, &ndm->ndm_seg, 1);
+	bus_dmamem_free(sc->sc_dmat, &ndm->ndm_seg, nsegs);
 destroy:
 	bus_dmamap_destroy(sc->sc_dmat, ndm->ndm_map);
 ndmfree:
 	kmem_free(ndm, sizeof(*ndm));
 	return NULL;
+}
+
+static struct nvme_dmamem *
+nvme_dmamem_alloc(struct nvme_softc *sc, size_t size)
+{
+	return nvme_dmamem_alloc1(sc, size, 1);
 }
 
 static void
@@ -2024,4 +2194,31 @@ nvmeioctl(dev_t dev, u_long cmd, void *data, int flag, struct lwp *l)
 	}
 
 	return ENOTTY;
+}
+
+/*
+ * Setup sysctl(3) MIB, hw.nvme.*
+ */
+SYSCTL_SETUP(sysctl_rtw, "sysctl nvme(4) subtree setup")
+{
+	const struct sysctlnode *cnode, *rnode;
+	int rc;
+
+	if ((rc = sysctl_createv(clog, 0, NULL, &rnode,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE,
+	    "nvme", SYSCTL_DESCR("NVM Express"),
+	    NULL, 0, NULL, 0,
+	    CTL_HW, CTL_CREATE, CTL_EOL)) != 0)
+		goto err;
+
+	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
+	    CTLFLAG_PERMANENT|CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "hmb_max_size", SYSCTL_DESCR("The max size of Host Memory Buffer"),
+	    NULL, 0, &nvme_hmb_max_size, 0,
+	    CTL_CREATE, CTL_EOL)) != 0)
+		goto err;
+
+	return;
+err:
+	printf("%s: sysctl_createv failed (rc = %d)\n", __func__, rc);
 }

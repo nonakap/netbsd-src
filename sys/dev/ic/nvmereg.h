@@ -372,6 +372,10 @@ NVME_CTASSERT(sizeof(struct nvme_cqe) == 16, "bad size for nvme_cqe");
 
 #define NVM_VOLATILE_WRITE_CACHE_WCE	__BIT(0) 	/* Write Cache Enable */
 
+/* NVM_FEAT_HOST_MEMORY_BUFFER */
+#define NVM_HOST_MEMORY_BUFFER_EHM	__BIT(0)	/* Enable Host Memory */
+#define NVM_HOST_MEMORY_BUFFER_MR	__BIT(1)	/* Memory Return */
+
 /* Power State Descriptor Data */
 struct nvm_identify_psd {
 	uint16_t	mp;		/* Max Power */
@@ -620,5 +624,13 @@ struct nvm_identify_namespace {
 	uint8_t		vs[3712];
 } __packed __aligned(8);
 NVME_CTASSERT(sizeof(struct nvm_identify_namespace) == 4096, "bad size for nvm_identify_namespace");
+
+/* Host Memory Buffer Descriptor Entry */
+struct nvme_hmb_descr_entry {
+	uint64_t	badd;		/* Buffer Address */
+	uint32_t	bsize;		/* Buffer Size */
+	uint8_t		_reserved[4];
+} __packed __aligned(16);
+NVME_CTASSERT(sizeof(struct nvme_hmb_descr_entry) == 16, "bad size for nvme_hmb_descr_entry");
 
 #endif	/* __NVMEREG_H__ */

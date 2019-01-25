@@ -134,6 +134,10 @@ struct nvme_softc {
 	struct nvme_queue	*sc_admin_q;
 	struct nvme_queue	**sc_q;
 
+	struct nvme_dmamem	*sc_hmb;
+	struct nvme_dmamem	*sc_hmb_descr;
+	uint32_t		sc_hmb_npg;
+
 	uint32_t		sc_flags;
 #define	NVME_F_ATTACHED	__BIT(0)
 #define	NVME_F_OPEN	__BIT(1)
