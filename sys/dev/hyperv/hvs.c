@@ -50,9 +50,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 
 #include <uvm/uvm_extern.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/hypervvar.h>
-#include <x86/x86/vmbusvar.h>
+#include <dev/hyperv/vmbusvar.h>
 
 #include <dev/scsipi/scsi_all.h>
 #include <dev/scsipi/scsiconf.h>
@@ -463,7 +461,7 @@ hvs_scsipi_request(struct scsipi_channel *chan, scsipi_adapter_req_t request,
 
 	switch (request) {
 	default:
-		aprint_error_dev(sc->sc_dev,
+		device_printf(sc->sc_dev,
 		    "%s: unhandled request %u\n", __func__, request);
 		return;
 
@@ -486,7 +484,7 @@ hvs_scsipi_request(struct scsipi_channel *chan, scsipi_adapter_req_t request,
 	xs = arg;
 
 	if (xs->cmdlen > MAX_SRB_DATA) {
-		aprint_error_dev(sc->sc_dev, "CDB is too big: %d\n",
+		device_printf(sc->sc_dev, "CDB is too big: %d\n",
 		    xs->cmdlen);
 		memset(&xs->sense, 0, sizeof(xs->sense));
 		xs->sense.scsi_sense.response_code =
@@ -499,7 +497,7 @@ hvs_scsipi_request(struct scsipi_channel *chan, scsipi_adapter_req_t request,
 
 	ccb = hvs_get_ccb(sc);
 	if (ccb == NULL) {
-		aprint_error_dev(sc->sc_dev, "failed to allocate ccb\n");
+		device_printf(sc->sc_dev, "failed to allocate ccb\n");
 		hvs_scsi_done(xs, XS_RESOURCE_SHORTAGE);
 		return;
 	}
@@ -549,7 +547,7 @@ hvs_scsipi_request(struct scsipi_channel *chan, scsipi_adapter_req_t request,
 		error = bus_dmamap_load(sc->sc_dmat, ccb->ccb_dmap, xs->data,
 		    xs->datalen, NULL, XS2DMA(xs));
 		if (error) {
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "failed to load %d bytes (%d)\n", xs->datalen,
 			    error);
 			hvs_put_ccb(sc, ccb);
@@ -602,7 +600,7 @@ hvs_start(struct hvs_softc *sc, struct vmbus_channel *chan, struct hvs_ccb *ccb)
 		error = vmbus_channel_send_prpl(chan, ccb->ccb_sgl,
 		    ccb->ccb_nsge, cmd, HVS_CMD_SIZE, ccb->ccb_rid);
 		if (error) {
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "failed to submit operation %x via prpl\n",
 			    cmd->cmd_op);
 			bus_dmamap_unload(sc->sc_dmat, ccb->ccb_dmap);
@@ -612,7 +610,7 @@ hvs_start(struct hvs_softc *sc, struct vmbus_channel *chan, struct hvs_ccb *ccb)
 		    ccb->ccb_rid, VMBUS_CHANPKT_TYPE_INBAND,
 		    VMBUS_CHANPKT_FLAG_RC);
 		if (error)
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "failed to submit operation %x\n", cmd->cmd_op);
 	}
 
@@ -686,12 +684,12 @@ hvs_intr(void *xsc)
 			/* No more messages to process */
 			return;
 		default:
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "error %d while receiving a reply\n", error);
 			return;
 		}
 		if (rlen != sizeof(cmd)) {
-			aprint_error_dev(sc->sc_dev, "short read: %u\n", rlen);
+			device_printf(sc->sc_dev, "short read: %u\n", rlen);
 			return;
 		}
 
@@ -704,7 +702,7 @@ hvs_intr(void *xsc)
 		switch (cmd.cmd_op) {
 		case HVS_MSG_IODONE:
 			if (rid >= sc->sc_nccb) {
-				aprint_error_dev(sc->sc_dev,
+				device_printf(sc->sc_dev,
 				    "invalid response %#"PRIx64"\n", rid);
 				continue;
 			}
@@ -716,7 +714,7 @@ hvs_intr(void *xsc)
 			hvs_scsi_probe(sc);
 			break;
 		default:
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "operation %u is not implemented\n", cmd.cmd_op);
 			break;
 		}
@@ -800,7 +798,7 @@ hvs_scsi_cmd_done(struct hvs_ccb *ccb)
 		break;
 	case SCSI_BUSY:
 	case SCSI_QUEUE_FULL:
-		aprint_error_dev(sc->sc_dev, "status %#x iostatus %#x (busy)\n",
+		device_printf(sc->sc_dev, "status %#x iostatus %#x (busy)\n",
 		    srb->srb_scsistatus, srb->srb_iostatus);
 		error = XS_BUSY;
 		break;

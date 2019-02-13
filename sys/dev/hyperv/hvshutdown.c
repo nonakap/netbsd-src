@@ -31,7 +31,7 @@
 __KERNEL_RCSID(0, "$NetBSD$");
 #endif
 #ifdef __FBSDID
-__FBSDID("$FreeBSD: head/sys/dev/hyperv/utilities/vmbus_heartbeat.c 310324 2016-12-20 09:46:14Z sephe $");
+__FBSDID("$FreeBSD: head/sys/dev/hyperv/utilities/vmbus_shutdown.c 310324 2016-12-20 09:46:14Z sephe $");
 #endif
 
 #include <sys/param.h>
@@ -40,59 +40,71 @@ __FBSDID("$FreeBSD: head/sys/dev/hyperv/utilities/vmbus_heartbeat.c 310324 2016-
 #include <sys/module.h>
 #include <sys/pmf.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/vmbusvar.h>
-#include <x86/x86/vmbusicreg.h>
-#include <x86/x86/vmbusicvar.h>
+#include <dev/sysmon/sysmonvar.h>
+#include <dev/sysmon/sysmon_taskq.h>
 
-#define VMBUS_HEARTBEAT_FWVER_MAJOR	3
-#define VMBUS_HEARTBEAT_FWVER		\
-	    VMBUS_IC_VERSION(VMBUS_HEARTBEAT_FWVER_MAJOR, 0)
+#include <dev/hyperv/vmbusvar.h>
+#include <dev/hyperv/vmbusicreg.h>
+#include <dev/hyperv/vmbusicvar.h>
 
-#define VMBUS_HEARTBEAT_MSGVER_MAJOR	3
-#define VMBUS_HEARTBEAT_MSGVER		\
-	    VMBUS_IC_VERSION(VMBUS_HEARTBEAT_MSGVER_MAJOR, 0)
+#define VMBUS_SHUTDOWN_FWVER_MAJOR	3
+#define VMBUS_SHUTDOWN_FWVER		\
+	    VMBUS_IC_VERSION(VMBUS_SHUTDOWN_FWVER_MAJOR, 0)
 
-static int	hvheartbeat_match(device_t, cfdata_t, void *);
-static void	hvheartbeat_attach(device_t, device_t, void *);
-static int	hvheartbeat_detach(device_t, int);
+#define VMBUS_SHUTDOWN_MSGVER_MAJOR	3
+#define VMBUS_SHUTDOWN_MSGVER		\
+	    VMBUS_IC_VERSION(VMBUS_SHUTDOWN_MSGVER_MAJOR, 0)
 
-static void	hvheartbeat_channel_cb(void *);
+static int	hvshutdown_match(device_t, cfdata_t, void *);
+static void	hvshutdown_attach(device_t, device_t, void *);
+static int	hvshutdown_detach(device_t, int);
 
-struct hvheartbeat_softc {
+static void	hvshutdown_channel_cb(void *);
+
+struct hvshutdown_softc {
 	struct vmbusic_softc	sc_vmbusic;
+
+	struct sysmon_pswitch	sc_smpsw;
 };
 
-CFATTACH_DECL_NEW(hvheartbeat, sizeof(struct hvheartbeat_softc),
-    hvheartbeat_match, hvheartbeat_attach, hvheartbeat_detach, NULL);
+CFATTACH_DECL_NEW(hvshutdown, sizeof(struct hvshutdown_softc),
+    hvshutdown_match, hvshutdown_attach, hvshutdown_detach, NULL);
 
 static int
-hvheartbeat_match(device_t parent, cfdata_t cf, void *aux)
+hvshutdown_match(device_t parent, cfdata_t cf, void *aux)
 {
 	struct vmbus_attach_args *aa = aux;
 
-	return vmbusic_probe(aa, &hyperv_guid_heartbeat);
+	return vmbusic_probe(aa, &hyperv_guid_shutdown);
 }
 
 static void
-hvheartbeat_attach(device_t parent, device_t self, void *aux)
+hvshutdown_attach(device_t parent, device_t self, void *aux)
 {
+	struct hvshutdown_softc *sc = device_private(self);
 	struct vmbus_attach_args *aa = aux;
 	int error;
 
 	aprint_naive("\n");
-	aprint_normal(": Hyper-V Heartbeat\n");
+	aprint_normal(": Hyper-V Shutdown\n");
 
-	error = vmbusic_attach(self, aa, hvheartbeat_channel_cb);
+	error = vmbusic_attach(self, aa, hvshutdown_channel_cb);
 	if (error)
 		return;
 
 	(void) pmf_device_register(self, NULL, NULL);
+
+	sysmon_task_queue_init();
+
+	sc->sc_smpsw.smpsw_name = device_xname(self);
+	sc->sc_smpsw.smpsw_type = PSWITCH_TYPE_POWER;
+	(void) sysmon_pswitch_register(&sc->sc_smpsw);
 }
 
 static int
-hvheartbeat_detach(device_t self, int flags)
+hvshutdown_detach(device_t self, int flags)
 {
+	struct hvshutdown_softc *sc = device_private(self);
 	int error;
 
 	error = vmbusic_detach(self, flags);
@@ -100,33 +112,43 @@ hvheartbeat_detach(device_t self, int flags)
 		return error;
 
 	pmf_device_deregister(self);
+	sysmon_pswitch_unregister(&sc->sc_smpsw);
 
 	return 0;
 }
 
 static void
-hvheartbeat_channel_cb(void *arg)
+hvshutdown_do_shutdown(void *arg)
 {
-	struct hvheartbeat_softc *sc = arg;
+	struct hvshutdown_softc *sc = arg;
+
+	sysmon_pswitch_event(&sc->sc_smpsw, PSWITCH_EVENT_PRESSED);
+}
+
+static void
+hvshutdown_channel_cb(void *arg)
+{
+	struct hvshutdown_softc *sc = arg;
 	struct vmbusic_softc *vsc = &sc->sc_vmbusic;
 	struct vmbus_channel *ch = vsc->sc_chan;
 	struct vmbus_icmsg_hdr *hdr;
-	struct vmbus_icmsg_heartbeat *msg;
+	struct vmbus_icmsg_shutdown *msg;
 	uint64_t rid;
 	uint32_t rlen;
 	int error;
+	bool do_shutdown = false;
 
 	error = vmbus_channel_recv(ch, vsc->sc_buf, vsc->sc_buflen,
 	    &rlen, &rid, 0);
 	if (error || rlen == 0) {
 		if (error != EAGAIN) {
-			DPRINTF("%s: heartbeat error=%d len=%u\n",
+			DPRINTF("%s: shutdown error=%d len=%u\n",
 			    device_xname(vsc->sc_dev), error, rlen);
 		}
 		return;
 	}
 	if (rlen < sizeof(*hdr)) {
-		DPRINTF("%s: heartbeat short read len=%u\n",
+		DPRINTF("%s: shutdown short read len=%u\n",
 		    device_xname(vsc->sc_dev), rlen);
 		return;
 	}
@@ -134,55 +156,67 @@ hvheartbeat_channel_cb(void *arg)
 	hdr = (struct vmbus_icmsg_hdr *)vsc->sc_buf;
 	switch (hdr->ic_type) {
 	case VMBUS_ICMSG_TYPE_NEGOTIATE:
-		error = vmbusic_negotiate(vsc, hdr, &rlen,
-		    VMBUS_HEARTBEAT_FWVER, VMBUS_HEARTBEAT_MSGVER);
+		error = vmbusic_negotiate(vsc, hdr, &rlen, VMBUS_SHUTDOWN_FWVER,
+		    VMBUS_SHUTDOWN_MSGVER);
 		if (error)
 			return;
 		break;
 
-	case VMBUS_ICMSG_TYPE_HEARTBEAT:
-		if (rlen < VMBUS_ICMSG_HEARTBEAT_SIZE_MIN) {
-			DPRINTF("%s: invalid heartbeat len=%u\n",
+	case VMBUS_ICMSG_TYPE_SHUTDOWN:
+		if (rlen < VMBUS_ICMSG_SHUTDOWN_SIZE_MIN) {
+			DPRINTF("%s: invalid shutdown len=%u\n",
 			    device_xname(vsc->sc_dev), rlen);
 			return;
 		}
 
-		msg = (struct vmbus_icmsg_heartbeat *)hdr;
-		msg->ic_seq++;
+		msg = (struct vmbus_icmsg_shutdown *)hdr;
+		if (msg->ic_haltflags == 0 || msg->ic_haltflags == 1) {
+			device_printf(vsc->sc_dev, "shutdown requested\n");
+			hdr->ic_status = VMBUS_ICMSG_STATUS_OK;
+			do_shutdown = true;
+		} else {
+			device_printf(vsc->sc_dev,
+			    "unknown shutdown flags 0x%08x\n",
+			    msg->ic_haltflags);
+			hdr->ic_status = VMBUS_ICMSG_STATUS_FAIL;
+		}
 		break;
 
 	default:
-		aprint_error_dev(vsc->sc_dev,
-		    "unhandled heartbeat message type %u\n", hdr->ic_type);
+		device_printf(vsc->sc_dev,
+		    "unhandled shutdown message type %u\n", hdr->ic_type);
 		return;
 	}
 
 	(void) vmbusic_sendresp(vsc, ch, vsc->sc_buf, rlen, rid);
+
+	if (do_shutdown)
+		sysmon_task_queue_sched(0, hvshutdown_do_shutdown, sc);
 }
 
-MODULE(MODULE_CLASS_DRIVER, hvheartbeat, "vmbus");
+MODULE(MODULE_CLASS_DRIVER, hvshutdown, "vmbus");
 
 #ifdef _MODULE
 #include "ioconf.c"
 #endif
 
 static int
-hvheartbeat_modcmd(modcmd_t cmd, void *aux)
+hvshutdown_modcmd(modcmd_t cmd, void *aux)
 {
 	int error = 0;
 
 	switch (cmd) {
 	case MODULE_CMD_INIT:
 #ifdef _MODULE
-		error = config_init_component(cfdriver_ioconf_hvheartbeat,
-		    cfattach_ioconf_hvheartbeat, cfdata_ioconf_hvheartbeat);
+		error = config_init_component(cfdriver_ioconf_hvshutdown,
+		    cfattach_ioconf_hvshutdown, cfdata_ioconf_hvshutdown);
 #endif
 		break;
 
 	case MODULE_CMD_FINI:
 #ifdef _MODULE
-		error = config_fini_component(cfdriver_ioconf_hvheartbeat,
-		    cfattach_ioconf_hvheartbeat, cfdata_ioconf_hvheartbeat);
+		error = config_fini_component(cfdriver_ioconf_hvshutdown,
+		    cfattach_ioconf_hvshutdown, cfdata_ioconf_hvshutdown);
 #endif
 		break;
 

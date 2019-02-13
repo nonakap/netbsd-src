@@ -45,8 +45,10 @@ __FBSDID("$FreeBSD: head/sys/dev/hyperv/vmbus/hyperv.c 331757 2018-03-30 02:25:1
 
 #include <sys/param.h>
 #include <sys/systm.h>
+#include <sys/kernel.h>
 #include <sys/device.h>
 #include <sys/bus.h>
+#include <sys/cpu.h>
 #include <sys/kmem.h>
 #include <sys/module.h>
 #include <sys/pmf.h>
@@ -61,7 +63,7 @@ __FBSDID("$FreeBSD: head/sys/dev/hyperv/vmbus/hyperv.c 331757 2018-03-30 02:25:1
 #include <machine/cpu_counter.h>
 
 #include <x86/x86/hypervreg.h>
-#include <x86/x86/hypervvar.h>
+#include <dev/hyperv/vmbusvar.h>
 
 struct hyperv_softc {
 	device_t		sc_dev;
@@ -78,22 +80,20 @@ static struct hyperv_hypercall_ctx hyperv_hypercall_ctx;
 
 static u_int	hyperv_get_timecount(struct timecounter *);
 
-u_int hyperv_ver_major;
+static u_int hyperv_ver_major;
 
-u_int hyperv_features;
-u_int hyperv_recommends;
+static u_int hyperv_features;		/* CPUID_HV_MSR_ */
+static u_int hyperv_recommends;
 
 static u_int hyperv_pm_features;
 static u_int hyperv_features3;
-
-const struct sysctlnode *hyperv_sysctl_node;
 
 static char hyperv_version_str[64];
 static char hyperv_features_str[256];
 static char hyperv_pm_features_str[256];
 static char hyperv_features3_str[256];
 
-hyperv_tc64_t hyperv_tc64;
+static int hyperv_idtvec;
 
 static struct timecounter hyperv_timecounter = {
 	.tc_get_timecount = hyperv_get_timecount,
@@ -105,12 +105,16 @@ static struct timecounter hyperv_timecounter = {
 
 static void	hyperv_proc_dummy(void *, struct cpu_info *);
 
-static struct hyperv_proc {
+struct hyperv_proc {
 	hyperv_proc_t	func;
 	void		*arg;
-} hyperv_event_proc = {
+};
+
+static struct hyperv_proc hyperv_event_proc = {
 	.func = hyperv_proc_dummy,
-}, hyperv_message_proc = {
+};
+
+static struct hyperv_proc hyperv_message_proc = {
 	.func = hyperv_proc_dummy,
 };
 
@@ -325,7 +329,7 @@ hyperv_hypercall_md(volatile void *hc_addr, uint64_t in_val, uint64_t in_paddr,
 	return status;
 }
 
-__inline uint64_t
+uint64_t
 hyperv_hypercall(uint64_t control, paddr_t in_paddr, paddr_t out_paddr)
 {
 
@@ -334,33 +338,6 @@ hyperv_hypercall(uint64_t control, paddr_t in_paddr, paddr_t out_paddr)
 
 	return hyperv_hypercall_md(hyperv_hypercall_ctx.hc_addr, control,
 	    in_paddr, out_paddr);
-}
-
-uint64_t
-hyperv_hypercall_post_message(paddr_t msg)
-{
-
-	return hyperv_hypercall(HYPERCALL_POST_MESSAGE, msg, 0);
-}
-
-uint64_t
-hyperv_hypercall_signal_event(paddr_t monprm)
-{
-
-	return hyperv_hypercall(HYPERCALL_SIGNAL_EVENT, monprm, 0);
-}
-
-int
-hyperv_guid2str(const struct hyperv_guid *guid, char *buf, size_t sz)
-{
-	const uint8_t *d = guid->hv_guid;
-
-	return snprintf(buf, sz, "%02x%02x%02x%02x-"
-	    "%02x%02x-%02x%02x-%02x%02x-"
-	    "%02x%02x%02x%02x%02x%02x",
-	    d[3], d[2], d[1], d[0],
-	    d[5], d[4], d[7], d[6], d[8], d[9],
-	    d[10], d[11], d[12], d[13], d[14], d[15]);
 }
 
 static bool
@@ -462,7 +439,7 @@ hyperv_identify(void)
 	return true;
 }
 
-bool
+static bool
 hyperv_init(void)
 {
 
@@ -505,7 +482,7 @@ hyperv_init(void)
 	return hyperv_init_hypercall();
 }
 
-bool
+static bool
 hyperv_is_initialized(void)
 {
 	uint64_t msr;
@@ -585,14 +562,23 @@ hyperv_detach(device_t self, int flags)
 }
 
 void
-hyperv_intr(struct trapframe *frame)
+hyperv_intr(void)
 {
 	struct cpu_info *ci = curcpu();
 
-	ci->ci_isources[LIR_HYPERV]->is_evcnt.ev_count++;
-
 	(*hyperv_event_proc.func)(hyperv_event_proc.arg, ci);
 	(*hyperv_message_proc.func)(hyperv_message_proc.arg, ci);
+}
+
+void hyperv_hypercall_intr(struct trapframe *);
+void
+hyperv_hypercall_intr(struct trapframe *frame __unused)
+{
+	struct cpu_info *ci = curcpu();
+
+	ci->ci_isources[LIR_HV]->is_evcnt.ev_count++;
+
+	hyperv_intr();
 }
 
 static void
@@ -685,82 +671,149 @@ hyperv_init_hypercall(void)
 	return true;
 }
 
-/*
- * Hyper-V bus_dma utilities.
- */
-void *
-hyperv_dma_alloc(bus_dma_tag_t dmat, struct hyperv_dma *dma, bus_size_t size,
-    bus_size_t alignment, bus_size_t boundary, int nsegs)
+int
+hyperv_hypercall_enabled(void)
 {
-	const int kmemflags = cold ? KM_NOSLEEP : KM_SLEEP;
-	const int dmaflags = cold ? BUS_DMA_NOWAIT : BUS_DMA_WAITOK;
-	int rseg, error;
 
-	KASSERT(dma != NULL);
-	KASSERT(dma->segs == NULL);
-	KASSERT(nsegs > 0);
+	return hyperv_is_initialized();
+}
 
-	dma->segs = kmem_zalloc(sizeof(*dma->segs) * nsegs, kmemflags);
-	if (dma->segs == NULL)
-		return NULL;
+int
+hyperv_synic_supported(void)
+{
 
-	dma->nsegs = nsegs;
-
-	error = bus_dmamem_alloc(dmat, size, alignment, boundary, dma->segs,
-	    nsegs, &rseg, dmaflags);
-	if (error) {
-		aprint_error("%s: bus_dmamem_alloc failed: error=%d\n",
-		    __func__, error);
-		goto fail1;
-	}
-	error = bus_dmamem_map(dmat, dma->segs, rseg, size, &dma->addr,
-	    dmaflags);
-	if (error) {
-		aprint_error("%s: bus_dmamem_map failed: error=%d\n",
-		    __func__, error);
-		goto fail2;
-	}
-	error = bus_dmamap_create(dmat, size, rseg, size, boundary, dmaflags,
-	    &dma->map);
-	if (error) {
-		aprint_error("%s: bus_dmamap_create failed: error=%d\n",
-		    __func__, error);
-		goto fail3;
-	}
-	error = bus_dmamap_load(dmat, dma->map, dma->addr, size, NULL,
-	    BUS_DMA_READ | BUS_DMA_WRITE | dmaflags);
-	if (error) {
-		aprint_error("%s: bus_dmamap_load failed: error=%d\n",
-		    __func__, error);
-		goto fail4;
-	}
-
-	return dma->addr;
-
-fail4:	bus_dmamap_destroy(dmat, dma->map);
-fail3:	bus_dmamem_unmap(dmat, dma->addr, size);
-	dma->addr = NULL;
-fail2:	bus_dmamem_free(dmat, dma->segs, rseg);
-fail1:	kmem_free(dma->segs, sizeof(*dma->segs) * nsegs);
-	dma->segs = NULL;
-	dma->nsegs = 0;
-	return NULL;
+	return (hyperv_features & CPUID_HV_MSR_SYNIC) ? 1 : 0;
 }
 
 void
-hyperv_dma_free(bus_dma_tag_t dmat, struct hyperv_dma *dma)
+hyperv_send_eom(void)
 {
-	bus_size_t size = dma->map->dm_mapsize;
-	int rsegs = dma->map->dm_nsegs;
 
-	bus_dmamap_unload(dmat, dma->map);
-	bus_dmamap_destroy(dmat, dma->map);
-	bus_dmamem_unmap(dmat, dma->addr, size);
-	dma->addr = NULL;
-	bus_dmamem_free(dmat, dma->segs, rsegs);
-	kmem_free(dma->segs, sizeof(*dma->segs) * dma->nsegs);
-	dma->segs = NULL;
-	dma->nsegs = 0;
+	wrmsr(MSR_HV_EOM, 0);
+}
+
+void
+vmbus_init_interrupts_md(struct vmbus_softc *sc)
+{
+	extern void Xintr_hyperv_hypercall(void);
+
+	/*
+	 * All Hyper-V ISR required resources are setup, now let's find a
+	 * free IDT vector for Hyper-V ISR and set it up.
+	 */
+	mutex_enter(&cpu_lock);
+	hyperv_idtvec = idt_vec_alloc(APIC_LEVEL(NIPL), IDT_INTR_HIGH);
+	mutex_exit(&cpu_lock);
+	KASSERT(hyperv_idtvec > 0);
+	idt_vec_set(hyperv_idtvec, Xintr_hyperv_hypercall);
+}
+
+void
+vmbus_deinit_interrupts_md(struct vmbus_softc *sc)
+{
+
+	if (hyperv_idtvec > 0) {
+		idt_vec_free(hyperv_idtvec);
+		hyperv_idtvec = 0;
+	}
+}
+
+void
+vmbus_init_synic_md(struct vmbus_softc *sc, cpuid_t cpu)
+{
+	struct vmbus_percpu_data *pd;
+	uint64_t val, orig;
+	uint32_t sint;
+
+	pd = &sc->sc_percpu[cpu];
+
+	if (hyperv_features & CPUID_HV_MSR_VP_INDEX) {
+		/* Save virtual processor id. */
+		pd->vcpuid = rdmsr(MSR_HV_VP_INDEX);
+	} else {
+		/* Set virtual processor id to 0 for compatibility. */
+		pd->vcpuid = 0;
+	}
+
+	/*
+	 * Setup the SynIC message.
+	 */
+	orig = rdmsr(MSR_HV_SIMP);
+	val = MSR_HV_SIMP_ENABLE | (orig & MSR_HV_SIMP_RSVD_MASK) |
+	    (atop(hyperv_dma_get_paddr(&pd->simp_dma)) << MSR_HV_SIMP_PGSHIFT);
+	wrmsr(MSR_HV_SIMP, val);
+
+	/*
+	 * Setup the SynIC event flags.
+	 */
+	orig = rdmsr(MSR_HV_SIEFP);
+	val = MSR_HV_SIEFP_ENABLE | (orig & MSR_HV_SIEFP_RSVD_MASK) |
+	    (atop(hyperv_dma_get_paddr(&pd->siep_dma)) << MSR_HV_SIEFP_PGSHIFT);
+	wrmsr(MSR_HV_SIEFP, val);
+
+	/*
+	 * Configure and unmask SINT for message and event flags.
+	 */
+	sint = MSR_HV_SINT0 + VMBUS_SINT_MESSAGE;
+	orig = rdmsr(sint);
+	val = hyperv_idtvec | MSR_HV_SINT_AUTOEOI |
+	    (orig & MSR_HV_SINT_RSVD_MASK);
+	wrmsr(sint, val);
+
+	/*
+	 * Configure and unmask SINT for timer.
+	 */
+	sint = MSR_HV_SINT0 + VMBUS_SINT_TIMER;
+	orig = rdmsr(sint);
+	val = hyperv_idtvec | MSR_HV_SINT_AUTOEOI |
+	    (orig & MSR_HV_SINT_RSVD_MASK);
+	wrmsr(sint, val);
+
+	/*
+	 * All done; enable SynIC.
+	 */
+	orig = rdmsr(MSR_HV_SCONTROL);
+	val = MSR_HV_SCTRL_ENABLE | (orig & MSR_HV_SCTRL_RSVD_MASK);
+	wrmsr(MSR_HV_SCONTROL, val);
+}
+
+void
+vmbus_deinit_synic_md(struct vmbus_softc *sc, cpuid_t cpu)
+{
+	uint64_t orig;
+	uint32_t sint;
+
+	/*
+	 * Disable SynIC.
+	 */
+	orig = rdmsr(MSR_HV_SCONTROL);
+	wrmsr(MSR_HV_SCONTROL, (orig & MSR_HV_SCTRL_RSVD_MASK));
+
+	/*
+	 * Mask message and event flags SINT.
+	 */
+	sint = MSR_HV_SINT0 + VMBUS_SINT_MESSAGE;
+	orig = rdmsr(sint);
+	wrmsr(sint, orig | MSR_HV_SINT_MASKED);
+
+	/*
+	 * Mask timer SINT.
+	 */
+	sint = MSR_HV_SINT0 + VMBUS_SINT_TIMER;
+	orig = rdmsr(sint);
+	wrmsr(sint, orig | MSR_HV_SINT_MASKED);
+
+	/*
+	 * Teardown SynIC message.
+	 */
+	orig = rdmsr(MSR_HV_SIMP);
+	wrmsr(MSR_HV_SIMP, (orig & MSR_HV_SIMP_RSVD_MASK));
+
+	/*
+	 * Teardown SynIC event flags.
+	 */
+	orig = rdmsr(MSR_HV_SIEFP);
+	wrmsr(MSR_HV_SIEFP, (orig & MSR_HV_SIEFP_RSVD_MASK));
 }
 
 static int
@@ -813,7 +866,7 @@ hyperv_sysctl_setup_root(struct hyperv_softc *sc)
 		goto fail;
 
 	error = sysctl_createv(&sc->sc_log, 0, &machdep_node, &hyperv_node,
-	    CTLFLAG_PERMANENT, CTLTYPE_NODE, device_xname(sc->sc_dev), NULL,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE, "hyperv", NULL,
 	    NULL, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 	if (error)
 		goto fail;
@@ -821,8 +874,6 @@ hyperv_sysctl_setup_root(struct hyperv_softc *sc)
 	error = hyperv_sysctl_setup(sc, hyperv_node);
 	if (error)
 		goto fail;
-
-	hyperv_sysctl_node = hyperv_node;
 
 	return 0;
 

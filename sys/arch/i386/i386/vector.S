@@ -326,14 +326,14 @@ IDTVEC_END(resume_lapic_ltimer)
 	 * Hyper-V event channel upcall interrupt handler.
 	 * Only used when the hypervisor supports direct vector callbacks.
 	 */
-IDTVEC(recurse_hyperv_upcall)
+IDTVEC(recurse_hyperv_hypercall)
 	INTR_RECURSE_HWFRAME
 	pushl	$0
 	pushl	$T_ASTFLT
 	INTRENTRY
 	jmp	1f
-IDTVEC_END(recurse_hyperv_upcall)
-IDTVEC(intr_hyperv_upcall)
+IDTVEC_END(recurse_hyperv_hypercall)
+IDTVEC(intr_hyperv_hypercall)
 	pushl	$0
 	pushl	$T_ASTFLT
 	INTRENTRY
@@ -341,22 +341,22 @@ IDTVEC(intr_hyperv_upcall)
 	cmpl	$IPL_NET,%ebx
 	jae	2f
 	jmp	1f
-IDTVEC_END(intr_hyperv_upcall)
-IDTVEC(resume_hyperv_upcall)
+IDTVEC_END(intr_hyperv_hypercall)
+IDTVEC(resume_hyperv_hypercall)
 1:
 	pushl	%ebx
 	IDEPTH_INCR
 	movl	$IPL_NET,CPUVAR(ILEVEL)
 	sti
 	pushl	%esp
-	call	_C_LABEL(hyperv_intr)
+	call	_C_LABEL(hyperv_hypercall_intr)
 	addl	$4,%esp
 	cli
 	jmp	_C_LABEL(Xdoreti)
 2:
-	orl	$(1 << LIR_HYPERV),CPUVAR(IPENDING)
+	orl	$(1 << LIR_HV),CPUVAR(IPENDING)
 	INTRFASTEXIT
-IDTVEC_END(resume_hyperv_upcall)
+IDTVEC_END(resume_hyperv_hypercall)
 #endif	/* NHYPERV > 0 */
 
 #endif /* NLAPIC > 0 */

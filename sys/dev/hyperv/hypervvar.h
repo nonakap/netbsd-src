@@ -60,12 +60,19 @@ __CTASSERT(sizeof(struct hyperv_reftsc) == PAGE_SIZE);
 
 #if defined(_KERNEL)
 
+int	hyperv_hypercall_enabled(void);
+int	hyperv_synic_supported(void);
+void	hyperv_send_eom(void);
+void	hyperv_intr(void);
+
+struct vmbus_softc;
+void	vmbus_init_interrupts_md(struct vmbus_softc *);
+void	vmbus_deinit_interrupts_md(struct vmbus_softc *);
+void	vmbus_init_synic_md(struct vmbus_softc *, cpuid_t);
+void	vmbus_deinit_synic_md(struct vmbus_softc *, cpuid_t);
+
 #define HYPERV_GUID_STRLEN	40
-
 struct hyperv_guid;
-struct trapframe;
-struct sysctlnode;
-
 int	hyperv_guid2str(const struct hyperv_guid *, char *, size_t);
 
 /*
@@ -75,19 +82,9 @@ int	hyperv_guid2str(const struct hyperv_guid *, char *, size_t);
 typedef uint64_t (*hyperv_tc64_t)(void);
 extern hyperv_tc64_t hyperv_tc64;
 
-extern u_int hyperv_ver_major;
-extern u_int hyperv_features;		/* CPUID_HV_MSR_ */
-extern u_int hyperv_recommends;
-
-extern const struct sysctlnode *hyperv_sysctl_node;
-
 uint64_t hyperv_hypercall(uint64_t, paddr_t, paddr_t);
 uint64_t hyperv_hypercall_post_message(paddr_t);
 uint64_t hyperv_hypercall_signal_event(paddr_t);
-
-bool	hyperv_init(void);
-bool	hyperv_is_initialized(void);
-void	hyperv_intr(struct trapframe *);
 
 typedef void (*hyperv_proc_t)(void *, struct cpu_info *);
 void	hyperv_set_event_proc(hyperv_proc_t, void *);
@@ -112,13 +109,6 @@ hyperv_dma_get_paddr(struct hyperv_dma *dma)
 void *hyperv_dma_alloc(bus_dma_tag_t, struct hyperv_dma *, bus_size_t,
     bus_size_t, bus_size_t, int);
 void hyperv_dma_free(bus_dma_tag_t, struct hyperv_dma *);
-
-/*
- * Vector used for Hyper-V Interrupts.
- */
-extern void Xintr_hyperv_upcall(void);
-extern void Xresume_hyperv_upcall(void);
-extern void Xrecurse_hyperv_upcall(void);
 
 #endif	/* _KERNEL */
 

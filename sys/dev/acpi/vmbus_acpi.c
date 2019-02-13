@@ -36,9 +36,7 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <dev/acpi/acpireg.h>
 #include <dev/acpi/acpivar.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/hypervvar.h>
-#include <x86/x86/vmbusvar.h>
+#include <dev/hyperv/vmbusvar.h>
 
 #define _COMPONENT	ACPI_RESOURCE_COMPONENT
 ACPI_MODULE_NAME	("vmbus_acpi")
@@ -65,13 +63,16 @@ vmbus_acpi_match(device_t parent, cfdata_t match, void *opaque)
 {
 	struct acpi_attach_args *aa = opaque;
 
-	if (!vmbus_match(parent, match, opaque))
-		return 0;
-
 	if (aa->aa_node->ad_type != ACPI_TYPE_DEVICE)
 		return 0;
 
-	return acpi_match_hid(aa->aa_node->ad_devinfo, vmbus_acpi_ids);
+	if (!acpi_match_hid(aa->aa_node->ad_devinfo, vmbus_acpi_ids))
+		return 0;
+
+	if (!vmbus_match(parent, match, opaque))
+		return 0;
+
+	return 1;
 }
 
 static void

@@ -39,9 +39,7 @@
 
 #include <sys/sysctl.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/hypervvar.h>
-#include <x86/x86/vmbusvar.h>
+#include <dev/hyperv/vmbusvar.h>
 
 struct vmbusic_softc {
 	device_t		sc_dev;

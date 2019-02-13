@@ -79,37 +79,6 @@ device	hyperv
 attach	hyperv at cpufeaturebus
 file	arch/x86/x86/hyperv.c		hyperv needs-flag
 
-define	hypervvmbus {}
-device	vmbus: hypervvmbus
-file	arch/x86/x86/vmbus.c		vmbus needs-flag
-
-device	hvn: ether, ifnet, arp
-attach	hvn at hypervvmbus
-file	arch/x86/x86/if_hvn.c		hvn
-
-device	hvs: scsi
-attach	hvs at hypervvmbus
-file	arch/x86/x86/hvs.c		hvs
-
-device	hvheartbeat
-attach	hvheartbeat at hypervvmbus
-file	arch/x86/x86/hvheartbeat.c	hvheartbeat
-
-device	hvkvp
-attach	hvkvp at hypervvmbus
-file	arch/x86/x86/hvkvp.c		hvkvp
-
-device	hvshutdown: sysmon_power, sysmon_taskq
-attach	hvshutdown at hypervvmbus
-file	arch/x86/x86/hvshutdown.c	hvshutdown
-
-device	hvtimesync
-attach	hvtimesync at hypervvmbus
-file	arch/x86/x86/hvtimesync.c	hvtimesync
-
-file	arch/x86/x86/vmbusic.c		hvheartbeat | hvkvp | hvshutdown |
-					hvtimesync
-
 file	arch/x86/x86/apic.c		ioapic | lapic
 file	arch/x86/x86/bus_dma.c		machdep
 file	arch/x86/x86/bus_space.c	machdep

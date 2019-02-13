@@ -29,8 +29,8 @@
 #include <sys/mutex.h>
 #include <sys/pool.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/hypervvar.h>
+#include <dev/hyperv/hypervreg.h>
+#include <dev/hyperv/hypervvar.h>
 
 /* #define HYPERV_DEBUG */
 
@@ -167,7 +167,6 @@ struct vmbus_softc {
 	/*
 	 * Rarely used fields
 	 */
-	int			sc_idtvec;
 	uint32_t		sc_flags;
 #define  VMBUS_SCFLAG_SYNIC		__BIT(0)
 #define  VMBUS_SCFLAG_CONNECTED		__BIT(1)

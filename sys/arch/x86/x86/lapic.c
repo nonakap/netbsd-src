@@ -612,51 +612,53 @@ lapic_calibrate_timer(struct cpu_info *ci)
 	int i;
 	char tbuf[9];
 
-	if (lapic_per_second == 0) {
-		aprint_debug_dev(ci->ci_dev, "calibrating local timer\n");
+	if (lapic_per_second != 0)
+		goto calibrate_done;
 
-		tc = timecounter;
-		if (tc->tc_quality <= 0) {
-			tick_func = (timecounter_get_t *)gettick;
-			tval = rtclock_tval;
-			mask = ~0u;
-			freq = TIMER_FREQ;
-		} else {
-			tick_func = tc->tc_get_timecount;
-			tval = mask = tc->tc_counter_mask;
-			freq = tc->tc_frequency;
-		}
-		end = freq / 100;
+	aprint_debug_dev(ci->ci_dev, "calibrating local timer\n");
 
-		/*
-		 * Configure timer to one-shot, interrupt masked,
-		 * large positive number.
-		 */
-		lapic_writereg(LAPIC_LVTT, LAPIC_LVTT_M);
-		lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
-		lapic_writereg(LAPIC_ICR_TIMER, 0x80000000);
-
-		x86_disable_intr();
-
-		initial_lapic = lapic_gettick();
-		initial_counter = tick_func(tc) & mask;
-
-		for (seen = 0; seen < end; seen += delta) {
-			cur_counter = tick_func(tc) & mask;
-			if (cur_counter > initial_counter)
-				delta = tval - (cur_counter - initial_counter);
-			else
-				delta = initial_counter - cur_counter;
-			initial_counter = cur_counter;
-		}
-		cur_lapic = lapic_gettick();
-
-		x86_enable_intr();
-
-		tmp = initial_lapic - cur_lapic;
-		lapic_per_second = (tmp * freq + seen / 2) / seen;
+	tc = timecounter;
+	if (tc->tc_quality <= 0) {
+		tick_func = (timecounter_get_t *)gettick;
+		tval = rtclock_tval;
+		mask = ~0u;
+		freq = TIMER_FREQ;
+	} else {
+		tick_func = tc->tc_get_timecount;
+		tval = mask = tc->tc_counter_mask;
+		freq = tc->tc_frequency;
 	}
+	end = freq / 100;
 
+	/*
+	 * Configure timer to one-shot, interrupt masked,
+	 * large positive number.
+	 */
+	lapic_writereg(LAPIC_LVTT, LAPIC_LVTT_M);
+	lapic_writereg(LAPIC_DCR_TIMER, LAPIC_DCRT_DIV1);
+	lapic_writereg(LAPIC_ICR_TIMER, 0x80000000);
+
+	x86_disable_intr();
+
+	initial_lapic = lapic_gettick();
+	initial_counter = tick_func(tc) & mask;
+
+	for (seen = 0; seen < end; seen += delta) {
+		cur_counter = tick_func(tc) & mask;
+		if (cur_counter > initial_counter)
+			delta = tval - (cur_counter - initial_counter);
+		else
+			delta = initial_counter - cur_counter;
+		initial_counter = cur_counter;
+	}
+	cur_lapic = lapic_gettick();
+
+	x86_enable_intr();
+
+	tmp = initial_lapic - cur_lapic;
+	lapic_per_second = (tmp * freq + seen / 2) / seen;
+
+calibrate_done:
 	humanize_number(tbuf, sizeof(tbuf), lapic_per_second, "Hz", 1000);
 
 	aprint_debug_dev(ci->ci_dev, "apic clock running at %s\n", tbuf);

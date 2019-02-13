@@ -61,10 +61,8 @@ __KERNEL_RCSID(0, "$NetBSD$");
 #include <dev/ic/ndisreg.h>
 #include <dev/ic/rndisreg.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/hypervvar.h>
-#include <x86/x86/vmbusvar.h>
-#include <x86/x86/if_hvnreg.h>
+#include <dev/hyperv/vmbusvar.h>
+#include <dev/hyperv/if_hvnreg.h>
 
 #ifndef EVL_PRIO_BITS
 #define EVL_PRIO_BITS	13
@@ -663,15 +661,14 @@ hvn_txeof(struct hvn_softc *sc, uint64_t tid)
 
 	id -= HVN_NVS_CHIM_SIG;
 	if (id >= HVN_TX_DESC) {
-		aprint_error_dev(sc->sc_dev, "tx packet index too large: %u",
-		    id);
+		device_printf(sc->sc_dev, "tx packet index too large: %u", id);
 		return;
 	}
 
 	txd = &sc->sc_tx_desc[id];
 
 	if ((m = txd->txd_buf) == NULL) {
-		aprint_error_dev(sc->sc_dev, "no mbuf @%u\n", id);
+		device_printf(sc->sc_dev, "no mbuf @%u\n", id);
 		return;
 	}
 	txd->txd_buf = NULL;
@@ -1018,7 +1015,7 @@ hvn_nvs_intr(void *arg)
 		    HVN_NVS_BUFSIZE, &rlen, &rid, 1);
 		if (rv != 0 || rlen == 0) {
 			if (rv != EAGAIN)
-				aprint_error_dev(sc->sc_dev,
+				device_printf(sc->sc_dev,
 				    "failed to receive an NVSP packet\n");
 			break;
 		}
@@ -1041,7 +1038,7 @@ hvn_nvs_intr(void *arg)
 				hvn_txeof(sc, cph->cph_tid);
 				break;
 			default:
-				aprint_error_dev(sc->sc_dev,
+				device_printf(sc->sc_dev,
 				    "unhandled NVSP packet type %u "
 				    "on completion\n", nvs->nvs_type);
 				break;
@@ -1052,13 +1049,13 @@ hvn_nvs_intr(void *arg)
 				hvn_rndis_input(sc, cph->cph_tid, cph);
 				break;
 			default:
-				aprint_error_dev(sc->sc_dev,
+				device_printf(sc->sc_dev,
 				    "unhandled NVSP packet type %u "
 				    "on receive\n", nvs->nvs_type);
 				break;
 			}
 		} else
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "unknown NVSP packet type %u\n", cph->cph_type);
 	}
 
@@ -1093,7 +1090,7 @@ hvn_nvs_cmd(struct hvn_softc *sc, void *cmd, size_t cmdsize, uint64_t tid,
 	} while (rv != 0 && --tries > 0);
 
 	if (tries == 0 && rv != 0) {
-		aprint_error_dev(sc->sc_dev,
+		device_printf(sc->sc_dev,
 		    "NVSP operation %u send error %d\n", hdr->nvs_type, rv);
 		return rv;
 	}
@@ -1112,7 +1109,7 @@ hvn_nvs_cmd(struct hvn_softc *sc, void *cmd, size_t cmdsize, uint64_t tid,
 	} while (--timo > 0 && sc->sc_nvsdone != 1);
 
 	if (timo == 0 && sc->sc_nvsdone != 1) {
-		aprint_error_dev(sc->sc_dev, "NVSP operation %u timed out\n",
+		device_printf(sc->sc_dev, "NVSP operation %u timed out\n",
 		    hdr->nvs_type);
 		return ETIMEDOUT;
 	}
@@ -1416,7 +1413,7 @@ hvn_rndis_cmd(struct hvn_softc *sc, struct rndis_cmd *rc, int timo)
 	} while (rv != 0 && --tries > 0);
 
 	if (tries == 0 && rv != 0) {
-		aprint_error_dev(sc->sc_dev,
+		device_printf(sc->sc_dev,
 		    "RNDIS operation %u send error %d\n", hdr->rm_type, rv);
 		return rv;
 	}
@@ -1443,7 +1440,7 @@ hvn_rndis_cmd(struct hvn_softc *sc, struct rndis_cmd *rc, int timo)
 			hvn_release_cmd(sc, rc);
 			rv = 0;
 		} else if (rv == ETIMEDOUT) {
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "RNDIS operation %u timed out\n", hdr->rm_type);
 		}
 		return rv;
@@ -1491,7 +1488,7 @@ hvn_rndis_input(struct hvn_softc *sc, uint64_t tid, void *arg)
 			hvn_rndis_status(sc, sc->sc_rx_ring + off, len);
 			break;
 		default:
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "unhandled RNDIS message type %u\n", type);
 			break;
 		}
@@ -1542,14 +1539,14 @@ hvn_rxeof(struct hvn_softc *sc, uint8_t *buf, uint32_t len)
 		return;
 
 	if (len < sizeof(*pkt)) {
-		aprint_error_dev(sc->sc_dev, "data packet too short: %u\n",
+		device_printf(sc->sc_dev, "data packet too short: %u\n",
 		    len);
 		return;
 	}
 
 	pkt = (struct rndis_packet_msg *)buf;
 	if (pkt->rm_dataoffset + pkt->rm_datalen > len) {
-		aprint_error_dev(sc->sc_dev,
+		device_printf(sc->sc_dev,
 		    "data packet out of bounds: %u@%u\n", pkt->rm_dataoffset,
 		    pkt->rm_datalen);
 		return;
@@ -1562,7 +1559,7 @@ hvn_rxeof(struct hvn_softc *sc, uint8_t *buf, uint32_t len)
 	}
 
 	if (pkt->rm_pktinfooffset + pkt->rm_pktinfolen > len) {
-		aprint_error_dev(sc->sc_dev,
+		device_printf(sc->sc_dev,
 		    "pktinfo is out of bounds: %u@%u vs %u\n",
 		    pkt->rm_pktinfolen, pkt->rm_pktinfooffset, len);
 		goto done;
@@ -1572,7 +1569,7 @@ hvn_rxeof(struct hvn_softc *sc, uint8_t *buf, uint32_t len)
 	    pkt->rm_pktinfooffset);
 	while (pkt->rm_pktinfolen > 0) {
 		if (pi->rm_size > pkt->rm_pktinfolen) {
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "invalid pktinfo size: %u/%u\n", pi->rm_size,
 			    pkt->rm_pktinfolen);
 			break;
@@ -1620,13 +1617,13 @@ hvn_rndis_complete(struct hvn_softc *sc, uint8_t *buf, uint32_t len)
 	memcpy(&id, buf + RNDIS_HEADER_OFFSET, sizeof(id));
 	if ((rc = hvn_complete_cmd(sc, id)) != NULL) {
 		if (len < rc->rc_cmplen)
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "RNDIS response %u too short: %u\n", id, len);
 		else
 			memcpy(&rc->rc_cmp, buf, rc->rc_cmplen);
 		if (len > rc->rc_cmplen &&
 		    len - rc->rc_cmplen > HVN_RNDIS_BUFSIZE)
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "RNDIS response %u too large: %u\n", id, len);
 		else if (len > rc->rc_cmplen)
 			memcpy(&rc->rc_cmpbuf, buf + rc->rc_cmplen,

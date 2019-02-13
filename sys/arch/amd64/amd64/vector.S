@@ -270,40 +270,40 @@ IDTVEC_END(intr_lapic_ltimer)
 	 * Hyper-V event channel upcall interrupt handler.
 	 * Only used when the hypervisor supports direct vector callbacks.
 	 */
-IDTVEC(recurse_hyperv_upcall)
+IDTVEC(recurse_hyperv_hypercall)
 	INTR_RECURSE_HWFRAME
 	pushq	$0
 	pushq	$T_ASTFLT
 	INTR_RECURSE_ENTRY
 	jmp	1f
-IDTVEC_END(recurse_hyperv_upcall)
-NENTRY(handle_hyperv_upcall)
+IDTVEC_END(recurse_hyperv_hypercall)
+NENTRY(handle_hyperv_hypercall)
 	movl	CPUVAR(ILEVEL),%ebx
 	cmpl	$IPL_NET,%ebx
 	jae	2f
 	jmp	1f
-END(handle_hyperv_upcall)
-IDTVEC(resume_hyperv_upcall)
+END(handle_hyperv_hypercall)
+IDTVEC(resume_hyperv_hypercall)
 1:
 	incl	CPUVAR(IDEPTH)
 	movl	$IPL_NET,CPUVAR(ILEVEL)
 	sti
 	pushq	%rbx
 	movq	%rsp,%rsi
-	call	_C_LABEL(hyperv_intr)
+	call	_C_LABEL(hyperv_hypercall_intr)
 	jmp	_C_LABEL(Xdoreti)
 2:
-	orl	$(1 << LIR_HYPERV),CPUVAR(IPENDING)
+	orl	$(1 << LIR_HV),CPUVAR(IPENDING)
 	INTRFASTEXIT
-IDTVEC_END(resume_hyperv_upcall)
+IDTVEC_END(resume_hyperv_hypercall)
 
 	TEXT_USER_BEGIN
-IDTVEC(intr_hyperv_upcall)
+IDTVEC(intr_hyperv_hypercall)
 	pushq	$0
 	pushq	$T_ASTFLT
 	INTRENTRY
-	jmp	_C_LABEL(handle_hyperv_upcall)
-IDTVEC_END(intr_hyperv_upcall)
+	jmp	_C_LABEL(handle_hyperv_hypercall)
+IDTVEC_END(intr_hyperv_hypercall)
 	TEXT_USER_END
 #endif	/* NHYPERV > 0 */
 

@@ -27,7 +27,7 @@
  */
 #define LIR_IPI		31
 #define LIR_TIMER	30
-#define LIR_HYPERV	29
+#define LIR_HV		29
 
 /*
  * XXX These should be lowest numbered, but right now would

@@ -40,10 +40,9 @@ __FBSDID("$FreeBSD: head/sys/dev/hyperv/utilities/vmbus_ic.c 310317 2016-12-20 0
 #include <sys/kmem.h>
 #include <sys/reboot.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/vmbusvar.h>
-#include <x86/x86/vmbusicreg.h>
-#include <x86/x86/vmbusicvar.h>
+#include <dev/hyperv/vmbusvar.h>
+#include <dev/hyperv/vmbusicreg.h>
+#include <dev/hyperv/vmbusicvar.h>
 
 #define VMBUS_IC_BRSIZE		(4 * PAGE_SIZE)
 
@@ -129,26 +128,26 @@ vmbusic_negotiate(struct vmbusic_softc *sc, void *data, uint32_t *dlen0,
 	 * Preliminary message verification.
 	 */
 	if (dlen < sizeof(*nego)) {
-		aprint_error_dev(sc->sc_dev, "truncated ic negotiate, len %d\n",
+		device_printf(sc->sc_dev, "truncated ic negotiate, len %d\n",
 		    dlen);
 		return EINVAL;
 	}
 	nego = data;
 
 	if (nego->ic_fwver_cnt == 0) {
-		aprint_error_dev(sc->sc_dev, "ic negotiate does not contain "
+		device_printf(sc->sc_dev, "ic negotiate does not contain "
 		    "framework version %u\n", nego->ic_fwver_cnt);
 		return EINVAL;
 	}
 	if (nego->ic_msgver_cnt == 0) {
-		aprint_error_dev(sc->sc_dev, "ic negotiate does not contain "
+		device_printf(sc->sc_dev, "ic negotiate does not contain "
 		    "message version %u\n", nego->ic_msgver_cnt);
 		return EINVAL;
 	}
 
 	cnt = nego->ic_fwver_cnt + nego->ic_msgver_cnt;
 	if (dlen < offsetof(struct vmbus_icmsg_negotiate, ic_ver[cnt])) {
-		aprint_error_dev(sc->sc_dev, "ic negotiate does not contain "
+		device_printf(sc->sc_dev, "ic negotiate does not contain "
 		    "versions %d\n", dlen);
 		return EINVAL;
 	}
@@ -171,7 +170,7 @@ vmbusic_negotiate(struct vmbusic_softc *sc, void *data, uint32_t *dlen0,
 		}
 	}
 	if (!has_fw_ver) {
-		aprint_error_dev(sc->sc_dev, "failed to select framework "
+		device_printf(sc->sc_dev, "failed to select framework "
 		    "version\n");
 		goto done;
 	}
@@ -193,8 +192,7 @@ vmbusic_negotiate(struct vmbusic_softc *sc, void *data, uint32_t *dlen0,
 		}
 	}
 	if (!has_msg_ver) {
-		aprint_error_dev(sc->sc_dev, "failed to select message "
-		    "version\n");
+		device_printf(sc->sc_dev, "failed to select message version\n");
 		goto done;
 	}
 
@@ -202,27 +200,27 @@ vmbusic_negotiate(struct vmbusic_softc *sc, void *data, uint32_t *dlen0,
 done:
 	if (bootverbose || !has_fw_ver || !has_msg_ver) {
 		if (has_fw_ver) {
-			aprint_verbose_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "sel framework version: %u.%u\n",
 			    VMBUS_ICVER_MAJOR(sel_fw_ver),
 			    VMBUS_ICVER_MINOR(sel_fw_ver));
 		}
 		for (i = 0; i < nego->ic_fwver_cnt; i++) {
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "supp framework version: %u.%u\n",
 			    VMBUS_ICVER_MAJOR(nego->ic_ver[i]),
 			    VMBUS_ICVER_MINOR(nego->ic_ver[i]));
 		}
 
 		if (has_msg_ver) {
-			aprint_verbose_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "sel message version: %u.%u\n",
 			    VMBUS_ICVER_MAJOR(sel_msg_ver),
 			    VMBUS_ICVER_MINOR(sel_msg_ver));
 		}
 		for (i = nego->ic_fwver_cnt;
 		    i < nego->ic_fwver_cnt + nego->ic_msgver_cnt; i++) {
-			aprint_error_dev(sc->sc_dev,
+			device_printf(sc->sc_dev,
 			    "supp message version: %u.%u\n",
 			    VMBUS_ICVER_MAJOR(nego->ic_ver[i]),
 			    VMBUS_ICVER_MINOR(nego->ic_ver[i]));
@@ -268,6 +266,6 @@ vmbusic_sendresp(struct vmbusic_softc *sc, struct vmbus_channel *chan,
 	error = vmbus_channel_send(chan, data, dlen, rid,
 	    VMBUS_CHANPKT_TYPE_INBAND, 0);
 	if (error != 0)
-		aprint_error_dev(sc->sc_dev, "resp send failed: %d\n", error);
+		device_printf(sc->sc_dev, "resp send failed: %d\n", error);
 	return error;
 }

@@ -405,9 +405,11 @@ include	"arch/i386/pnpbios/files.pnpbios"
 include "dev/acpi/files.acpi"
 file	arch/i386/acpi/acpi_wakeup_low.S	acpi
 
-# Hyper-V VMBus
+# Microsoft Hyper-V
+include "dev/hyperv/files.hyperv"
+
 attach	vmbus at acpinodebus with vmbus_acpi
-file	arch/x86/acpi/vmbus_acpi.c		vmbus_acpi
+file	dev/acpi/vmbus_acpi.c			vmbus_acpi
 
 # Obsolete vesabios/vesafb flags
 obsolete	defflag	opt_vesabios.h	VESABIOSVERBOSE

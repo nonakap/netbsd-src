@@ -42,10 +42,9 @@ __FBSDID("$FreeBSD: head/sys/dev/hyperv/utilities/vmbus_timesync.c 322488 2017-0
 #include <sys/sysctl.h>
 #include <sys/timetc.h>
 
-#include <x86/x86/hypervreg.h>
-#include <x86/x86/vmbusvar.h>
-#include <x86/x86/vmbusicreg.h>
-#include <x86/x86/vmbusicvar.h>
+#include <dev/hyperv/vmbusvar.h>
+#include <dev/hyperv/vmbusicreg.h>
+#include <dev/hyperv/vmbusicvar.h>
 
 #define VMBUS_TIMESYNC_FWVER_MAJOR	3
 #define VMBUS_TIMESYNC_FWVER		\
@@ -136,9 +135,11 @@ do_timesync(struct hvtimesync_softc *sc, uint64_t hvtime, uint64_t sent_tc,
 	vm_ns = (vm_ts.tv_sec * NANOSECOND) + vm_ts.tv_nsec;
 
 	if ((tsflags & VMBUS_ICMSG_TS_FLAG_SYNC) && !hvtimesync_ignore_sync) {
-		aprint_verbose_dev(vsc->sc_dev,
+#if 0
+		device_printf(vsc->sc_dev,
 		    "apply sync request, hv: %ju, vm: %ju\n",
 		    (uintmax_t)hv_ns, (uintmax_t)vm_ns);
+#endif
 		hv_ts.tv_sec = hv_ns / NANOSECOND;
 		hv_ts.tv_nsec = hv_ns % NANOSECOND;
 		tc_setclock(&hv_ts);
@@ -149,7 +150,7 @@ do_timesync(struct hvtimesync_softc *sc, uint64_t hvtime, uint64_t sent_tc,
 	if ((tsflags & VMBUS_ICMSG_TS_FLAG_SAMPLE) &&
 	    hvtimesync_sample_thresh >= 0) {
 		if (hvtimesnyc_sample_verbose) {
-			aprint_normal_dev(vsc->sc_dev,
+			device_printf(vsc->sc_dev,
 			    "sample request, hv: %ju, vm: %ju\n",
 			    (uintmax_t)hv_ns, (uintmax_t)vm_ns);
 		}
@@ -162,7 +163,7 @@ do_timesync(struct hvtimesync_softc *sc, uint64_t hvtime, uint64_t sent_tc,
 		diff /= 1000000;
 
 		if (diff > hvtimesync_sample_thresh) {
-			aprint_normal_dev(vsc->sc_dev,
+			device_printf(vsc->sc_dev,
 			    "apply sample request, hv: %ju, vm: %ju\n",
 			    (uintmax_t)hv_ns, (uintmax_t)vm_ns);
 			hv_ts.tv_sec = hv_ns / NANOSECOND;
@@ -240,7 +241,7 @@ hvtimesync_channel_cb(void *arg)
 		break;
 
 	default:
-		aprint_error_dev(vsc->sc_dev,
+		device_printf(vsc->sc_dev,
 		    "unhandled _timesync message type %u\n", hdr->ic_type);
 		return;
 	}
@@ -251,30 +252,51 @@ hvtimesync_channel_cb(void *arg)
 static int
 hvtimesync_sysctl_setup(device_t self)
 {
-	const struct sysctlnode *node;
 	struct hvtimesync_softc *sc = device_private(self);
 	struct vmbusic_softc *vsc = &sc->sc_vmbusic;
+	const struct sysctlnode *node;
 	int error;
 
-	if (hyperv_sysctl_node == NULL)
-		return ENXIO;
+	error = sysctl_createv(NULL, 0, NULL, &node,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE, "machdep", NULL,
+	    NULL, 0, NULL, 0, CTL_MACHDEP, CTL_EOL);
+	if (error)
+		return error;
+	error = sysctl_createv(NULL, 0, &node, &node,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE, "hyperv", NULL,
+	    NULL, 0, NULL, 0, CTL_CREATE, CTL_EOL);
+	if (error)
+		return error;
 
-	error = sysctl_createv(&vsc->sc_log, 0, &hyperv_sysctl_node, &node,
+	error = sysctl_createv(&vsc->sc_log, 0, &node, &node,
 	    0, CTLTYPE_NODE, "timesync", NULL,
 	    NULL, 0, NULL, 0, CTL_CREATE, CTL_EOL);
 	if (error)
-		goto fail;
+		return error;
 
-	/* XXX sysctl hvtimesync_ignore_sync */
-	/* XXX sysctl hvtimesnyc_sample_verbose */
-	/* XXX sysctl hvtimesync_sample_thresh */
+	error = sysctl_createv(&vsc->sc_log, 0, &node, NULL,
+	    CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "ignore_sync", NULL,
+	    NULL, 0, &hvtimesync_ignore_sync, 0,
+	    CTL_CREATE, CTL_EOL);
+	if (error)
+		return error;
+	error = sysctl_createv(&vsc->sc_log, 0, &node, NULL,
+	    CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "sample_verbose", NULL,
+	    NULL, 0, &hvtimesnyc_sample_verbose, 0,
+	    CTL_CREATE, CTL_EOL);
+	if (error)
+		return error;
+	error = sysctl_createv(&vsc->sc_log, 0, &node, NULL,
+	    CTLFLAG_READWRITE,
+	    CTLTYPE_INT, "sample_thresh", NULL,
+	    NULL, 0, &hvtimesync_sample_thresh, 0,
+	    CTL_CREATE, CTL_EOL);
+	if (error)
+		return error;
 
 	return 0;
-
-fail:
-	sysctl_teardown(&vsc->sc_log);
-	vsc->sc_log = NULL;
-	return error;
 }
 
 MODULE(MODULE_CLASS_DRIVER, hvtimesync, "vmbus");
