@@ -1411,7 +1411,7 @@ hvs*		at vmbus?		# Hyper-V StorVSC
 hvheartbeat*	at vmbus?		# Hyper-V Heartbeat Service
 hvshutdown*	at vmbus?		# Hyper-V Guest Shutdown Service
 hvtimesync*	at vmbus?		# Hyper-V Time Synchronization Service
-#hvkvp*		at vmbus?		# Hyper-V Data Exchange Service
+hvkvp*		at vmbus?		# Hyper-V Data Exchange Service
 
 
 # Pull in optional local configuration

@@ -172,13 +172,13 @@ hvshutdown_channel_cb(void *arg)
 		msg = (struct vmbus_icmsg_shutdown *)hdr;
 		if (msg->ic_haltflags == 0 || msg->ic_haltflags == 1) {
 			device_printf(vsc->sc_dev, "shutdown requested\n");
-			hdr->ic_status = VMBUS_ICMSG_STATUS_OK;
+			hdr->ic_status = HV_S_OK;
 			do_shutdown = true;
 		} else {
 			device_printf(vsc->sc_dev,
 			    "unknown shutdown flags 0x%08x\n",
 			    msg->ic_haltflags);
-			hdr->ic_status = VMBUS_ICMSG_STATUS_FAIL;
+			hdr->ic_status = HV_E_FAIL;
 		}
 		break;
 
