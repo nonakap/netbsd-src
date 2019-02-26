@@ -32,15 +32,14 @@
 #ifndef _VMBUSICREG_H_
 #define _VMBUSICREG_H_
 
+#include <dev/hyperv/hypervio.h>
+
 #define VMBUS_ICMSG_TYPE_NEGOTIATE	0
 #define VMBUS_ICMSG_TYPE_HEARTBEAT	1
 #define VMBUS_ICMSG_TYPE_KVP		2
 #define VMBUS_ICMSG_TYPE_SHUTDOWN	3
 #define VMBUS_ICMSG_TYPE_TIMESYNC	4
 #define VMBUS_ICMSG_TYPE_VSS		5
-
-#define VMBUS_ICMSG_STATUS_OK		0x00000000
-#define VMBUS_ICMSG_STATUS_FAIL		0x80004005
 
 #define VMBUS_IC_VERSION(major, minor)	((major) | (((uint32_t)(minor)) << 16))
 #define VMBUS_ICVER_MAJOR(ver)		((ver) & 0xffff)
@@ -63,7 +62,7 @@ struct vmbus_icmsg_hdr {
 	uint16_t		ic_type;
 	uint32_t		ic_msgver;	/* message version */
 	uint16_t		ic_dsize;	/* data size */
-	uint32_t		ic_status;	/* VMBUS_ICMSG_STATUS_ */
+	uint32_t		ic_status;	/* HV_S_OK, ... */
 	uint8_t			ic_tid;
 	uint8_t			ic_flags;	/* VMBUS_ICMSG_FLAG_ */
 	uint8_t			ic_rsvd[2];
@@ -135,36 +134,9 @@ struct vmbus_icmsg_timesync4 {
 
 #define VMBUS_ICMSG_TS_BASE		116444736000000000ULL
 
-/* Registry value types */
-#define VMBUS_KVP_REG_SZ		1
-#define VMBUS_KVP_REG_U32		4
-#define VMBUS_KVP_REG_U64		8
-
-/* Hyper-V status codes */
-#define VMBUS_KVP_S_OK			0x00000000
-#define VMBUS_KVP_E_FAIL		0x80004005
-#define VMBUS_KVP_S_CONT		0x80070103
-
-#define VMBUS_KVP_MAX_VAL_SIZE		2048
-#define VMBUS_KVP_MAX_KEY_SIZE		512
-
-enum vmbus_kvp_op {
-	VMBUS_KVP_OP_GET = 0,
-	VMBUS_KVP_OP_SET,
-	VMBUS_KVP_OP_DELETE,
-	VMBUS_KVP_OP_ENUMERATE,
-	VMBUS_KVP_OP_GET_IP_INFO,
-	VMBUS_KVP_OP_SET_IP_INFO,
-	VMBUS_KVP_OP_COUNT
-};
-
-enum vmbus_kvp_pool {
-	VMBUS_KVP_POOL_EXTERNAL = 0,
-	VMBUS_KVP_POOL_GUEST,
-	VMBUS_KVP_POOL_AUTO,
-	VMBUS_KVP_POOL_AUTO_EXTERNAL,
-	VMBUS_KVP_POOL_COUNT
-};
+/* VMBUS_ICMSG_TYPE_KVP */
+#define VMBUS_KVP_MAX_VAL_SIZE		1024
+#define VMBUS_KVP_MAX_KEY_SIZE		256
 
 union vmbus_kvp_hdr {
 	struct {
@@ -184,8 +156,8 @@ struct vmbus_kvp_msg_val {
 	uint32_t		kvm_valtype;
 	uint32_t		kvm_keylen;
 	uint32_t		kvm_vallen;
-	uint8_t			kvm_key[VMBUS_KVP_MAX_KEY_SIZE];
-	uint8_t			kvm_val[VMBUS_KVP_MAX_VAL_SIZE];
+	uint16_t		kvm_key[VMBUS_KVP_MAX_KEY_SIZE];
+	uint16_t		kvm_val[VMBUS_KVP_MAX_VAL_SIZE];
 } __packed;
 
 struct vmbus_kvp_msg_enum {
@@ -193,31 +165,27 @@ struct vmbus_kvp_msg_enum {
 	uint32_t		kvm_valtype;
 	uint32_t		kvm_keylen;
 	uint32_t		kvm_vallen;
-	uint8_t			kvm_key[VMBUS_KVP_MAX_KEY_SIZE];
-	uint8_t			kvm_val[VMBUS_KVP_MAX_VAL_SIZE];
+	uint16_t		kvm_key[VMBUS_KVP_MAX_KEY_SIZE];
+	uint16_t		kvm_val[VMBUS_KVP_MAX_VAL_SIZE];
 } __packed;
 
 struct vmbus_kvp_msg_del {
 	uint32_t		kvm_keylen;
-	uint8_t			kvm_key[VMBUS_KVP_MAX_KEY_SIZE];
+	uint16_t		kvm_key[VMBUS_KVP_MAX_KEY_SIZE];
 } __packed;
 
-#define ADDR_FAMILY_NONE	0x00
-#define ADDR_FAMILY_IPV4	0x01
-#define ADDR_FAMILY_IPV6	0x02
-
-#define MAX_MAC_ADDR_SIZE	256
-#define MAX_IP_ADDR_SIZE	2048
-#define MAX_GATEWAY_SIZE	1024
+#define VMBUS_KVP_MAX_ADAPTER_ID_SIZE	128
+#define VMBUS_KVP_MAX_IP_ADDR_SIZE	1024
+#define VMBUS_KVP_MAX_GATEWAY_SIZE	512
 
 struct vmbus_kvp_msg_addr {
-	uint8_t			kvm_mac[MAX_MAC_ADDR_SIZE];
+	uint16_t		kvm_adapter_id[VMBUS_KVP_MAX_ADAPTER_ID_SIZE];
 	uint8_t			kvm_family;
 	uint8_t			kvm_dhcp;
-	uint8_t			kvm_addr[MAX_IP_ADDR_SIZE];
-	uint8_t			kvm_netmask[MAX_IP_ADDR_SIZE];
-	uint8_t			kvm_gateway[MAX_GATEWAY_SIZE];
-	uint8_t			kvm_dns[MAX_IP_ADDR_SIZE];
+	uint16_t		kvm_addr[VMBUS_KVP_MAX_IP_ADDR_SIZE];
+	uint16_t		kvm_netmask[VMBUS_KVP_MAX_IP_ADDR_SIZE];
+	uint16_t		kvm_gateway[VMBUS_KVP_MAX_GATEWAY_SIZE];
+	uint16_t		kvm_dns[VMBUS_KVP_MAX_IP_ADDR_SIZE];
 } __packed;
 
 union vmbus_kvp_msg {
@@ -227,20 +195,20 @@ union vmbus_kvp_msg {
 };
 
 struct vmbus_icmsg_kvp {
-	struct vmbus_icmsg_hdr	ic_hdr;
-	union vmbus_kvp_hdr	ic_kvh;
-	union vmbus_kvp_msg	ic_kvm;
+	struct vmbus_icmsg_hdr		ic_hdr;
+	union vmbus_kvp_hdr		ic_kvh;
+	union vmbus_kvp_msg		ic_kvm;
 } __packed;
 
 struct vmbus_icmsg_kvp_addr {
-	struct vmbus_icmsg_hdr	ic_hdr;
+	struct vmbus_icmsg_hdr		ic_hdr;
 	struct {
 		struct {
 			uint8_t	kvu_op;
 			uint8_t	kvu_pool;
 		} req;
-	}			ic_kvh;
-	struct vmbus_kvp_msg_addr ic_kvm;
+	}				ic_kvh;
+	struct vmbus_kvp_msg_addr	ic_kvm;
 } __packed;
 
 #endif	/* _VMBUSICREG_H_ */
