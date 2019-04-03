@@ -48,10 +48,15 @@ __KERNEL_RCSID(0, "$NetBSD: nvme.c,v 1.44 2019/06/28 15:08:47 jmcneill Exp $");
 int nvme_adminq_size = 32;
 int nvme_ioq_size = 1024;
 
-#ifndef NVME_HMB_MAX_SIZE
-#define NVME_HMB_MAX_SIZE	128
-#endif
-u_int nvme_hmb_max_size = NVME_HMB_MAX_SIZE;	/* MiB */
+/*
+ * HMB allocation policy:
+ *
+ * >0: fixed size (in MiB)
+ *  0: HMB is not used
+ * -1: use preferred size
+ * -2: use minimum size
+ */
+int nvme_hmb_max_size = -1;
 
 static int	nvme_print(void *, const char *);
 
@@ -419,13 +424,8 @@ nvme_attach(struct nvme_softc *sc)
 	nvme_ccbs_free(sc->sc_admin_q);
 	nvme_ccbs_alloc(sc->sc_admin_q, sc->sc_admin_q->q_entries);
 
-	if (sc->sc_identify.hmpre > 0) {
-		if (nvme_init_host_memory_buffer(sc) != 0) {
-			aprint_error_dev(sc->sc_dev,
-			    "unable to setup host memory buffer\n");
-			goto disable;
-		}
-	}
+	if (sc->sc_identify.hmpre > 0)
+		nvme_init_host_memory_buffer(sc);
 
 	if (sc->sc_use_mq) {
 		/* Limit the number of queues to the number allocated in HW */
@@ -1867,42 +1867,57 @@ nvme_init_host_memory_buffer(struct nvme_softc *sc)
 	char buf[32];
 	bus_dmamap_t dmap;
 	struct nvme_hmb_descr_entry *descr;
-	uint64_t max = (uint64_t)nvme_hmb_max_size * 1024 * 1024;
-	uint64_t preferred = (uint64_t)sc->sc_identify.hmpre * 4096;
-	uint64_t min = (uint64_t)sc->sc_identify.hmmin * 4096;
-	uint64_t size, seg;
+	uint64_t preferred, minsz, maxsz, size, npg, seg;
 	uint32_t cdw11 = NVM_HOST_MEMORY_BUFFER_EHM;
 	int error;
 
-	if (min > max) {
-		aprint_error_dev(sc->sc_dev,
-		    "min size of HMB buffer exceeded max size: "
-		    "%"PRIu64" > %"PRIu64"\n", min, max);
+	preferred = (uint64_t)sc->sc_identify.hmpre * 4096;
+	minsz = (uint64_t)sc->sc_identify.hmmin * 4096;
+
+	if (nvme_hmb_max_size == 0) {
+		/* HMB is not used. */
+		aprint_normal_dev(sc->sc_dev, "HMB is not used\n");
+		nvme_free_host_memory_buffer(sc);
+		return 0;
+	} else if (nvme_hmb_max_size > 0) {
+		/* Limit the memory used by HMB. */
+		maxsz = (uint64_t)nvme_hmb_max_size * 1024 * 1024;
+		aprint_debug_dev(sc->sc_dev, "HMB: max=%"PRIu64"\n", maxsz);
+		if (minsz > maxsz) {
+			aprint_error_dev(sc->sc_dev,
+			    "minimum size of HMB buffer exceeded maximum size: "
+			    "%"PRIu64" > %"PRIu64"\n", minsz, maxsz);
+			nvme_free_host_memory_buffer(sc);
+			return 0;
+		}
+		size = MIN(preferred, maxsz);
+	} else if (nvme_hmb_max_size == -1) {
+		aprint_debug_dev(sc->sc_dev, "HMB: using preferred size\n");
+		size = preferred;
+	} else if (nvme_hmb_max_size == -2) {
+		aprint_debug_dev(sc->sc_dev, "HMB: using minimum size\n");
+		size = minsz;
+	} else {
+		aprint_error_dev(sc->sc_dev, "unknown HMB allocation policy\n");
 		nvme_free_host_memory_buffer(sc);
 		return 0;
 	}
 
-	preferred = MIN(preferred, max);
-	size = preferred;
-
 	if (sc->sc_hmb != NULL) {
-		if (sc->sc_hmb->ndm_size >= preferred) {
+		if (sc->sc_hmb->ndm_size >= size) {
 			/* Reuse the current buffer. */
 			cdw11 |= NVM_HOST_MEMORY_BUFFER_MR;
-		} else
+		} else {
 			nvme_free_host_memory_buffer(sc);
+		}
 	}
 	if (sc->sc_hmb == NULL) {
-		for (size = preferred; size != 0 && size > min; size /= 2) {
-			uint64_t npg = howmany(size, sc->sc_mps);
-			sc->sc_hmb = nvme_dmamem_alloc1(sc, npg * sc->sc_mps, 
-			    npg > INT_MAX ? INT_MAX : (int)npg);
-			if (sc->sc_hmb != NULL)
-				break;
-		}
+		npg = howmany(size, sc->sc_mps);
+		aprint_debug_dev(sc->sc_dev, "HMB: pages=%"PRIu64"\n", npg);
+		sc->sc_hmb = nvme_dmamem_alloc1(sc, npg * sc->sc_mps, 
+		    npg > INT_MAX ? INT_MAX : (int)npg);
 		if (sc->sc_hmb == NULL) {
-			aprint_error_dev(sc->sc_dev,
-			    "failed to allocate HMB buffer\n");
+			aprint_error_dev(sc->sc_dev, "failed to allocate HMB\n");
 			return 0;
 		}
 		nvme_dmamem_sync(sc, sc->sc_hmb, BUS_DMASYNC_PREWRITE);
@@ -1937,7 +1952,7 @@ nvme_init_host_memory_buffer(struct nvme_softc *sc)
 	}
 
 	format_bytes(buf, sizeof(buf), size);
-	aprint_normal_dev(sc->sc_dev, "using HMB, %s\n", buf);
+	aprint_normal_dev(sc->sc_dev, "%s host memory buffer\n", buf);
 
 	return 0;
 }
@@ -2025,7 +2040,7 @@ static struct nvme_dmamem *
 nvme_dmamem_alloc1(struct nvme_softc *sc, size_t size, int nsegments)
 {
 	struct nvme_dmamem *ndm;
-	int nsegs;
+	int nsegs, error;
 
 	ndm = kmem_zalloc(sizeof(*ndm), KM_SLEEP);
 	if (ndm == NULL)
@@ -2033,22 +2048,38 @@ nvme_dmamem_alloc1(struct nvme_softc *sc, size_t size, int nsegments)
 
 	ndm->ndm_size = size;
 
-	if (bus_dmamap_create(sc->sc_dmat, size, btoc(round_page(size)), size,
-	    0, BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &ndm->ndm_map) != 0)
+	error = bus_dmamap_create(sc->sc_dmat, size, btoc(round_page(size)),
+	    size, 0, BUS_DMA_WAITOK | BUS_DMA_ALLOCNOW, &ndm->ndm_map);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamap_create failed: %d\n",
+		    error);
 		goto ndmfree;
+	}
 
-	if (bus_dmamem_alloc(sc->sc_dmat, size, sc->sc_mps, 0, &ndm->ndm_seg,
-	    nsegments, &nsegs, BUS_DMA_WAITOK) != 0)
+	error = bus_dmamem_alloc(sc->sc_dmat, size, sc->sc_mps, 0,
+	    &ndm->ndm_seg, nsegments, &nsegs, BUS_DMA_WAITOK);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamem_alloc failed: %d\n",
+		    error);
 		goto destroy;
+	}
 
-	if (bus_dmamem_map(sc->sc_dmat, &ndm->ndm_seg, nsegs, size,
-	    &ndm->ndm_kva, BUS_DMA_WAITOK) != 0)
+	error = bus_dmamem_map(sc->sc_dmat, &ndm->ndm_seg, nsegs, size,
+	    &ndm->ndm_kva, BUS_DMA_WAITOK);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamem_map failed: %d\n",
+		    error);
 		goto free;
+	}
 	memset(ndm->ndm_kva, 0, size);
 
-	if (bus_dmamap_load(sc->sc_dmat, ndm->ndm_map, ndm->ndm_kva, size,
-	    NULL, BUS_DMA_WAITOK) != 0)
+	error = bus_dmamap_load(sc->sc_dmat, ndm->ndm_map, ndm->ndm_kva, size,
+	    NULL, BUS_DMA_WAITOK);
+	if (error != 0) {
+		aprint_debug_dev(sc->sc_dev, "bus_dmamap_load failed: %d\n",
+		    error);
 		goto unmap;
+	}
 
 	return ndm;
 
@@ -2213,7 +2244,8 @@ SYSCTL_SETUP(sysctl_rtw, "sysctl nvme(4) subtree setup")
 
 	if ((rc = sysctl_createv(clog, 0, &rnode, &cnode,
 	    CTLFLAG_PERMANENT|CTLFLAG_READWRITE, CTLTYPE_INT,
-	    "hmb_max_size", SYSCTL_DESCR("The max size of Host Memory Buffer"),
+	    "hmb_max_size",
+	    SYSCTL_DESCR("The maximum size of Host Memory Buffer"),
 	    NULL, 0, &nvme_hmb_max_size, 0,
 	    CTL_CREATE, CTL_EOL)) != 0)
 		goto err;
