@@ -84,6 +84,7 @@ _CDMAKEFSOPTIONS=	rockridge,label=${ISO_VOLID},publisher=${PUBLISHER}
 .if ${MKREPRO_TIMESTAMP:Uno} != "no"
 MAKEFS_TIMESTAMP=-T "${MKREPRO_TIMESTAMP}"
 PAX_TIMESTAMP=--timestamp "${MKREPRO_TIMESTAMP}"
+GPT_TIMESTAMP=-T "${MKREPRO_TIMESTAMP}"
 .endif
 
 .if ${MKUNPRIVED} == "no"
@@ -147,6 +148,34 @@ BOOT2=boot.${MACHINE}
 .else
 BOOT2=boot
 .endif
+.endif
+
+.if exists(${DESTDIR}/usr/mdec/bootia32.efi) || \
+    exists(${DESTDIR}/usr/mdec/bootx64.efi)
+ISODEPENDS+=	${CDIMAGE}.esp
+
+CLEANFILES+=	${CDIMAGE}.esp
+CLEANFILES+=	${CDIMAGE}.tmp
+
+BOOTEFI=
+.if exists(${DESTDIR}/usr/mdec/bootia32.efi)
+BOOTEFI+=	${DESTDIR}/usr/mdec/bootia32.efi
+.endif
+.if exists(${DESTDIR}/usr/mdec/bootx64.efi)
+BOOTEFI+=	${DESTDIR}/usr/mdec/bootx64.efi
+.endif
+
+${CDIMAGE}.esp: ${BOOTEFI}
+	${MKDIR} ${MKDIRPERM} "${CUROBJDIR}/esp/EFI/BOOT"
+	${RM} -f esp/EFI/BOOT/*.efi
+	${INSTALL} ${COPY} -m 0644 ${.ALLSRC} esp/EFI/BOOT/
+.if defined(CDBOOTOPTIONS)
+	.for efi in ${BOOTEFI}
+		${TOOL_INSTALLBOOT} -m${MACHINE} -e ${CDBOOTOPTIONS} ${efi}
+	.endfor
+.endif
+	${RM} -f ${CDIMAGE}.esp
+	${TOOL_MAKEFS} -M 1m -m 1m -t msdos ${MAKEFS_TIMESTAMP} ${CDIMAGE}.esp esp
 .endif
 
 prepare:
@@ -269,7 +298,7 @@ copy-releasedir:
 	fi
 .endif
 
-image:
+image: ${ISODEPENDS}
 	@echo Preparing spec files for makefs...
 	${RM} -f ${WORKSPEC}
 	if [ -d cdrom/etc/mtree ]; then				\
@@ -295,6 +324,13 @@ image:
 	if [ -s ${WORKSPEC} ]; then specarg="-F ${WORKSPEC}"; fi;	\
 	${TOOL_MAKEFS} -N ${NETBSDSRCDIR}/etc -t cd9660 $${specarg} 	\
 		${MAKEFS_TIMESTAMP} ${CDMAKEFSEXTRAOPTS} -o ${_CDMAKEFSOPTIONS:Q} ${CDIMAGE} cdrom
+.if exists(${CDIMAGE}.esp)
+	${RM} -f ${CDIMAGE}.tmp
+	mv ${CDIMAGE} ${CDIMAGE}.tmp
+	dd if=/dev/zero bs=1m count=1 | cat ${CDIMAGE}.tmp ${CDIMAGE}.esp - > ${CDIMAGE}
+	${TOOL_GPT} ${GPT_TIMESSTAMP} ${CDIMAGE} create -p 1
+	${TOOL_GPT} ${GPT_TIMESSTAMP} ${CDIMAGE} add -b $$(( ( $$(ls -l ${CDIMAGE}.tmp | ${TOOL_AWK} '{print $$5}') ) / 512 )) -s 1m -t efi -l "EFI system"
+.endif
 
 .if ${CDRELEASE} == false
 release: prepare .WAIT prepare_md_post .WAIT copy-releasedir .WAIT image_md_pre .WAIT image .WAIT image_md_post
@@ -314,7 +350,7 @@ clean:
 	@if [ -d cdrom/var/spool/ftp/hidden ]; then 		\
 		${CHMOD} +r cdrom/var/spool/ftp/hidden;		\
 	fi	# XXX
-	${RM} -fr cdrom
+	${RM} -fr cdrom esp
 
 prepare_md_post: .PHONY
 image_md_post: .PHONY
