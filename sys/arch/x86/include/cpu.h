@@ -151,17 +151,20 @@ struct cpu_info {
 	volatile int	ci_mtx_count;	/* Negative count of spin mutexes */
 	volatile int	ci_mtx_oldspl;	/* Old SPL at this ci_idepth */
 
-	/* The following must be aligned for cmpxchg8b. */
+	/* The following must be aligned for cmpxchg16b. */
 	struct {
-		uint32_t	ipending;
+		u_long		ipending;
 		int		ilevel;
-	} ci_istate __aligned(8);
+#ifdef __x86_64__
+		int		_mbz;	/* Must be zero */
+#endif
+	} ci_istate __aligned(16);
 #define ci_ipending	ci_istate.ipending
 #define	ci_ilevel	ci_istate.ilevel
 	int		ci_idepth;
 	void *		ci_intrstack;
-	uint32_t	ci_imask[NIPL];
-	uint32_t	ci_iunmask[NIPL];
+	u_long		ci_imask[NIPL];
+	u_long		ci_iunmask[NIPL];
 
 	uint32_t ci_flags;		/* flags; see below */
 	uint32_t ci_ipis;		/* interprocessor interrupts pending */

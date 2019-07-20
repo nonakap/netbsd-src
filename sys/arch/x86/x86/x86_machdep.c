@@ -323,7 +323,7 @@ cpu_need_resched(struct cpu_info *ci, int flags)
 #ifdef __HAVE_PREEMPTION
 		atomic_or_uint(&l->l_dopreempt, DOPREEMPT_ACTIVE);
 		if (ci == cur) {
-			softint_trigger(1 << SIR_PREEMPT);
+			softint_trigger(1UL << SIR_PREEMPT);
 		} else {
 			x86_send_ipi(ci, X86_IPI_KPREEMPT);
 		}
@@ -391,7 +391,7 @@ cpu_kpreempt_enter(uintptr_t where, int s)
 	 * mutexes at IPL_NONE are _not_ valid to use.
 	 */
 	if (s > IPL_PREEMPT) {
-		softint_trigger(1 << SIR_PREEMPT);
+		softint_trigger(1UL << SIR_PREEMPT);
 		aston(l, X86_AST_PREEMPT);	/* paranoid */
 		return false;
 	}

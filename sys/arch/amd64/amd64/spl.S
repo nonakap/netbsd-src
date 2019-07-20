@@ -173,7 +173,7 @@ END(softintr_ret)
  * Software interrupt registration.
  */
 ENTRY(softint_trigger)
-	orl	%edi,CPUVAR(IPENDING)	/* atomic on local cpu */
+	orq	%rdi,CPUVAR(IPENDING)	/* atomic on local cpu */
 	ret
 END(softint_trigger)
 
@@ -217,17 +217,17 @@ IDTVEC_END(resume_preempt)
 /*
  * void spllower(int s);
  *
- * Must be the same size as cx8_spllower().  This must use
+ * Must be the same size as cx16_spllower().  This must use
  * pushf/cli/popf as it is used early in boot where interrupts
  * are disabled via eflags/IE.
  */
 ENTRY(spllower)
 	cmpl	CPUVAR(ILEVEL),%edi
 	jae	1f
-	movl	CPUVAR(IUNMASK)(,%rdi,4),%edx
+	movq	CPUVAR(IUNMASK)(,%rdi,8),%rdx
 	pushf
 	cli
-	testl	CPUVAR(IPENDING),%edx
+	testq	CPUVAR(IPENDING),%rdx
 	jnz	2f
 	movl	%edi,CPUVAR(ILEVEL)
 	popf
@@ -244,43 +244,43 @@ END(spllower)
 LABEL(spllower_end)
 
 /*
- * void	cx8_spllower(int s);
+ * void	cx16_spllower(int s);
  *
- * For cmpxchg8b, edx/ecx are the high words and eax/ebx the low.
+ * For cmpxchg16b, rdx/rcx are the high words and rax/rbx the low.
  *
- * edx : eax = old level / old ipending
- * ecx : ebx = new level / old ipending
+ * rdx : rax = old level / old ipending
+ * rcx : rbx = new level / old ipending
  */
-ENTRY(cx8_spllower)
+ENTRY(cx16_spllower)
 	movl	CPUVAR(ILEVEL),%edx
 	movq	%rbx,%r8
 	cmpl	%edx,%edi			/* new level is lower? */
 	jae	1f
 0:
-	movl	CPUVAR(IPENDING),%eax
+	movq	CPUVAR(IPENDING),%rax
 	movl	%edi,%ecx
-	testl	%eax,CPUVAR(IUNMASK)(,%rcx,4)/* deferred interrupts? */
-	movl	%eax,%ebx
+	testq	%rax,CPUVAR(IUNMASK)(,%rcx,8)/* deferred interrupts? */
+	movq	%rax,%rbx
 	/*
 	 * On the P4 this jump is cheaper than patching in junk
 	 * using cmov.  Is cmpxchg expensive if it fails?
 	 */
 	jnz	2f
-	cmpxchg8b CPUVAR(ISTATE)		/* swap in new ilevel */
+	cmpxchg16b CPUVAR(ISTATE)	/* swap in new ilevel */
 	jnz	0b
 1:
 	movq	%r8,%rbx
 	ret
 2:
 	movq	%r8,%rbx
-	.type	_C_LABEL(cx8_spllower_patch), @function
-LABEL(cx8_spllower_patch)
+	.type	_C_LABEL(cx16_spllower_patch), @function
+LABEL(cx16_spllower_patch)
 	jmp	_C_LABEL(Xspllower)
+END(cx16_spllower_patch)
 
 	.align	16
-END(cx8_spllower_patch)
-END(cx8_spllower)
-LABEL(cx8_spllower_end)
+END(cx16_spllower)
+LABEL(cx16_spllower_end)
 #endif /* !XENPV */
 
 /*
@@ -301,7 +301,7 @@ LABEL(cx8_spllower_end)
  * (see pmap_tlb_shootnow).
  */
 	nop
-	.align	4	/* Avoid confusion with cx8_spllower_end */
+	.align	4	/* Avoid confusion with cx16_spllower_end */
 
 IDTVEC(spllower)
 	pushq	%rbx
@@ -311,12 +311,12 @@ IDTVEC(spllower)
 	leaq	1f(%rip),%r13		/* address to resume loop at */
 1:	movl	%ebx,%eax		/* get cpl */
 #if !defined(XENPV)
-	movl	CPUVAR(IUNMASK)(,%rax,4),%eax
+	movq	CPUVAR(IUNMASK)(,%rax,8),%rax
 	CLI(si)
-	andl	CPUVAR(IPENDING),%eax	/* any non-masked bits left? */
+	andq	CPUVAR(IPENDING),%rax	/* any non-masked bits left? */
 	jz	2f
-	bsrl	%eax,%eax
-	btrl	%eax,CPUVAR(IPENDING)
+	bsrq	%rax,%rax
+	btrq	%rax,CPUVAR(IPENDING)
 	movq	CPUVAR(ISOURCES)(,%rax,8),%rax
 	jmp	*IS_RECURSE(%rax)
 #endif
@@ -355,12 +355,12 @@ IDTVEC(doreti)
 	leaq	1f(%rip),%r13
 1:	movl	%ebx,%eax
 #if !defined(XENPV)
-	movl	CPUVAR(IUNMASK)(,%rax,4),%eax
+	movq	CPUVAR(IUNMASK)(,%rax,8),%rax
 	CLI(si)
-	andl	CPUVAR(IPENDING),%eax
+	andq	CPUVAR(IPENDING),%rax
 	jz	2f
-	bsrl	%eax,%eax		/* slow, but not worth optimizing */
-	btrl	%eax,CPUVAR(IPENDING)
+	bsrq	%rax,%rax		/* slow, but not worth optimizing */
+	btrq	%rax,CPUVAR(IPENDING)
 	movq	CPUVAR(ISOURCES)(,%rax,8),%rax
 	jmp	*IS_RESUME(%rax)
 #endif

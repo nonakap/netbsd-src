@@ -159,6 +159,7 @@ __KERNEL_RCSID(0, "$NetBSD: intr.c,v 1.146 2019/06/17 06:38:30 msaitoh Exp $");
 
 #include <uvm/uvm_extern.h>
 
+#include <machine/cpuvar.h>
 #include <machine/i8259.h>
 #include <machine/pio.h>
 
@@ -304,11 +305,12 @@ x86_nmi(void)
 static void
 intr_calculatemasks(struct cpu_info *ci)
 {
-	int irq, level, unusedirqs, intrlevel[MAX_INTR_SOURCES];
+	u_long unusedirqs, intrlevel[MAX_INTR_SOURCES];
+	int irq, level;
 	struct intrhand *q;
 
 	/* First, figure out which levels each IRQ uses. */
-	unusedirqs = 0xffffffff;
+	unusedirqs = ULONG_MAX;
 	for (irq = 0; irq < MAX_INTR_SOURCES; irq++) {
 		int levels = 0;
 
@@ -320,20 +322,20 @@ intr_calculatemasks(struct cpu_info *ci)
 			levels |= 1U << q->ih_level;
 		intrlevel[irq] = levels;
 		if (levels)
-			unusedirqs &= ~(1U << irq);
+			unusedirqs &= ~(1UL << irq);
 	}
 
 	/* Then figure out which IRQs use each level. */
 	for (level = 0; level < NIPL; level++) {
-		int irqs = 0;
+		u_long irqs = 0;
 		for (irq = 0; irq < MAX_INTR_SOURCES; irq++)
-			if (intrlevel[irq] & (1U << level))
-				irqs |= 1U << irq;
+			if (intrlevel[irq] & (1UL << level))
+				irqs |= 1UL << irq;
 		ci->ci_imask[level] = irqs | unusedirqs;
 	}
 
-	for (level = 0; level<(NIPL-1); level++)
-		ci->ci_imask[level+1] |= ci->ci_imask[level];
+	for (level = 0; level < (NIPL - 1); level++)
+		ci->ci_imask[level + 1] |= ci->ci_imask[level];
 
 	for (irq = 0; irq < MAX_INTR_SOURCES; irq++) {
 		int maxlevel = IPL_NONE;
@@ -1008,7 +1010,7 @@ intr_disestablish_xcall(void *arg1, void *arg2)
 	idtvec = source->is_idtvec;
 
 	(*pic->pic_hwmask)(pic, ih->ih_pin);
-	atomic_and_32(&ci->ci_ipending, ~(1 << ih->ih_slot));
+	atomic_and_ulong(&ci->ci_ipending, ~(1UL << ih->ih_slot));
 
 	/*
 	 * Remove the handler from the chain.
@@ -1331,7 +1333,7 @@ intr_printconfig(void)
 		(*pr)("%s: interrupt masks:\n", device_xname(ci->ci_dev));
 		for (i = 0; i < NIPL; i++)
 			(*pr)("IPL %d mask %08lx unmask %08lx\n", i,
-			    (u_long)ci->ci_imask[i], (u_long)ci->ci_iunmask[i]);
+			    ci->ci_imask[i], ci->ci_iunmask[i]);
 		for (i = 0; i < MAX_INTR_SOURCES; i++) {
 			isp = ci->ci_isources[i];
 			if (isp == NULL)
@@ -1401,7 +1403,7 @@ softint_init_md(lwp_t *l, u_int level, uintptr_t *machdep)
 
 	KASSERT(ci->ci_isources[sir] == NULL);
 
-	*machdep = (1 << sir);
+	*machdep = (1UL << sir);
 	ci->ci_isources[sir] = isp;
 	ci->ci_isources[sir]->is_lwp = l;
 
@@ -1853,7 +1855,7 @@ intr_set_affinity(struct intrsource *isp, const kcpuset_t *cpuset)
 
 	pin = isp->is_pin;
 	(*pic->pic_hwmask)(pic, pin); /* for ci_ipending check */
-	while (oldci->ci_ipending & (1 << oldslot))
+	while (oldci->ci_ipending & (1UL << oldslot))
 		(void)kpause("intrdist", false, 1, &cpu_lock);
 
 	kpreempt_disable();

@@ -198,7 +198,7 @@ static void
 x86_ipi_kpreempt(struct cpu_info *ci)
 {
 
-	softint_trigger(1 << SIR_PREEMPT);
+	softint_trigger(1UL << SIR_PREEMPT);
 }
 
 /*

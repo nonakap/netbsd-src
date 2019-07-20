@@ -63,11 +63,18 @@ void	spllower_end(void);
 void	cx8_spllower(int);
 void	cx8_spllower_end(void);
 void	cx8_spllower_patch(void);
+void	cx16_spllower(int);
+void	cx16_spllower_end(void);
+void	cx16_spllower_patch(void);
 
 void	mutex_spin_exit_end(void);
 void	i686_mutex_spin_exit(int);
 void	i686_mutex_spin_exit_end(void);
 void	i686_mutex_spin_exit_patch(void);
+void	cx16_mutex_spin_exit(int);
+void	cx16_mutex_spin_exit_end(void);
+void	cx16_mutex_spin_exit_patch(void);
+void	cx16_mutex_spin_exit_diag_patch(void) __weak;
 
 void	membar_consumer(void);
 void	membar_consumer_end(void);
@@ -250,6 +257,7 @@ x86_patch(bool early)
 #endif	/* i386 */
 
 #if !defined(SPLDEBUG)
+#if defined(i386)
 	if (!early && (cpu_feature[0] & CPUID_CX8) != 0) {
 		/* Faster splx(), mutex_spin_exit(). */
 		patchfunc(
@@ -257,14 +265,35 @@ x86_patch(bool early)
 		    spllower, spllower_end,
 		    cx8_spllower_patch
 		);
-#if defined(i386) && !defined(LOCKDEBUG)
+#if !defined(LOCKDEBUG)
 		patchfunc(
 		    i686_mutex_spin_exit, i686_mutex_spin_exit_end,
 		    mutex_spin_exit, mutex_spin_exit_end,
 		    i686_mutex_spin_exit_patch
 		);
-#endif	/* i386 && !LOCKDEBUG */
+#endif	/* !LOCKDEBUG */
 	}
+#else	/* !i386 */
+	if (!early && (cpu_feature[1] & CPUID2_CX16) != 0) {
+		/* Faster splx(), mutex_spin_exit(). */
+		patchfunc(
+		    cx16_spllower, cx16_spllower_end,
+		    spllower, spllower_end,
+		    cx16_spllower_patch
+		);
+#if !defined(LOCKDEBUG)
+		patchfunc(
+		    cx16_mutex_spin_exit, cx16_mutex_spin_exit_end,
+		    mutex_spin_exit, mutex_spin_exit_end,
+		    cx16_mutex_spin_exit_patch
+		);
+		if (cx16_mutex_spin_exit_diag_patch) {
+			adjust_jumpoff((void *)cx16_mutex_spin_exit_diag_patch,
+			    cx16_mutex_spin_exit, mutex_spin_exit);
+		}
+#endif	/* !LOCKDEBUG */
+	}
+#endif	/* i386 */
 #endif /* !SPLDEBUG */
 
 	/*

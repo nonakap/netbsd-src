@@ -113,10 +113,10 @@ END(mutex_spin_enter)
  * void mutex_spin_exit(kmutex_t *mtx);
  *
  * Release a spin mutex and post a load fence.
+ * Must be the same size as cx16_mutex_spin_exit().
  */
 ENTRY(mutex_spin_exit)
 #ifdef DIAGNOSTIC
-
 	movl	$0x0001, %eax			/* new + expected value */
 	movq	CPUVAR(SELF), %r8
 	cmpxchgb %ah, MTX_LOCK(%rdi)		/* unlock */
@@ -126,10 +126,20 @@ ENTRY(mutex_spin_exit)
 	jnz	1f
 	cmpl	CPU_INFO_ILEVEL(%r8), %edi
 	jae	1f
+#else	/* !DIAGNOSTIC */
+	movq	CPUVAR(SELF), %r8
+	movb	$0x00, MTX_LOCK(%rdi)
+	movl	CPU_INFO_MTX_OLDSPL(%r8), %edi
+	incl	CPU_INFO_MTX_COUNT(%r8)
+	movl	CPU_INFO_ILEVEL(%r8), %edx
+	cmovnzl	%edx, %edi
+	cmpl	%edx, %edi			/* new level is lower? */
+	jae	1f
+#endif	/* DIAGNOSTIC */
 #if !defined(XENPV)
-	movl	CPU_INFO_IUNMASK(%r8,%rdi,4), %esi
+	movq	CPU_INFO_IUNMASK(%r8,%rdi,8), %rsi
 	CLI(ax)
-	testl	CPU_INFO_IPENDING(%r8), %esi
+	testq	CPU_INFO_IPENDING(%r8), %rsi
 	jnz	_C_LABEL(Xspllower)
 #endif
 #if defined(XEN)
@@ -142,6 +152,58 @@ ENTRY(mutex_spin_exit)
 	STI(ax)
 1:	rep					/* double byte ret as branch */
 	ret					/* target: see AMD docs */
+
+	.space	16
+	.align	16
+END(mutex_spin_exit)
+LABEL(mutex_spin_exit_end)
+
+/*
+ * void cx16_mutex_spin_exit(kmutex_t *mtx);
+ *
+ * Must be the same size as mutex_spin_exit().
+ */
+ENTRY(cx16_mutex_spin_exit)
+#ifdef DIAGNOSTIC
+
+	movl	$0x0001, %eax			/* new + expected value */
+	movq	CPUVAR(SELF), %r8
+	cmpxchgb %ah, MTX_LOCK(%rdi)		/* unlock */
+	jnz	2f				/* hard case if problems */
+	movl	CPU_INFO_MTX_OLDSPL(%r8), %edi
+	incl	CPU_INFO_MTX_COUNT(%r8)
+	jnz	1f
+	cmpl	CPU_INFO_ILEVEL(%r8), %edi
+	jae	1f
+#if !defined(XENPV)
+	movq	CPU_INFO_IUNMASK(%r8,%rdi,8), %rsi
+	CLI(ax)
+	testq	CPU_INFO_IPENDING(%r8), %rsi
+	jnz	3f
+#endif
+#if defined(XEN)
+	movl	CPU_INFO_XUNMASK(%r8,%rdi,4), %esi
+	CLI(ax)
+	testl	CPU_INFO_XPENDING(%r8), %esi
+	jnz	3f
+#endif
+	movl	%edi, CPU_INFO_ILEVEL(%r8)
+	STI(ax)
+1:	rep					/* double byte ret as branch */
+	ret					/* target: see AMD docs */
+
+	.type   _C_LABEL(cx16_mutex_spin_exit_diag_patch), @function
+LABEL(cx16_mutex_spin_exit_diag_patch)
+2:
+	jmp	_C_LABEL(mutex_vector_exit)
+END(cx16_mutex_spin_exit_diag_patch)
+
+	.type   _C_LABEL(cx16_mutex_spin_exit_patch), @function
+LABEL(cx16_mutex_spin_exit_patch)
+3:
+	jmp	_C_LABEL(Xspllower)
+
+	.space	16
 
 #else	/* DIAGNOSTIC */
 
@@ -156,11 +218,11 @@ ENTRY(mutex_spin_exit)
 	jae	2f
 1:
 #if !defined(XENPV)
-	movl	CPU_INFO_IPENDING(%rsi),%eax
-	testl	%eax,CPU_INFO_IUNMASK(%rsi,%rcx,4)/* deferred interrupts? */
+	movq	CPU_INFO_IPENDING(%rsi),%rax
+	testq	%rax,CPU_INFO_IUNMASK(%rsi,%rcx,8)/* deferred interrupts? */
 	jnz	3f
-	movl	%eax,%ebx
-	cmpxchg8b CPU_INFO_ISTATE(%rsi)		/* swap in new ilevel */
+	movq	%rax,%rbx
+	cmpxchg16b CPU_INFO_ISTATE(%rsi)	/* swap in new ilevel */
 	jnz	4f
 #endif
 #if defined(XEN)
@@ -177,13 +239,18 @@ ENTRY(mutex_spin_exit)
 3:
 	popq	%rbx
 	movl	%ecx, %edi
+        .type   _C_LABEL(cx16_mutex_spin_exit_patch), @function
+LABEL(cx16_mutex_spin_exit_patch)
 	jmp	_C_LABEL(Xspllower)
+END(cx16_mutex_spin_exit_patch)
 4:
 	jmp	1b
 
 #endif	/* DIAGNOSTIC */
 
-END(mutex_spin_exit)
+	.align	16
+END(cx16_mutex_spin_exit)
+LABEL(cx16_mutex_spin_exit_end)
 
 /*
  * void	rw_enter(krwlock_t *rwl, krw_t op);
