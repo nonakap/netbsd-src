@@ -408,9 +408,8 @@ acpi_md_mcfg_validate(uint64_t addr, int bus_start, int *bus_end)
 	int i, n;
 
 #ifndef XENPV
-	if (lookup_bootinfo(BTINFO_EFIMEMMAP) != NULL)
-		bim = efi_get_e820memmap();
-	else
+	bim = efi_get_e820memmap();
+	if (bim == NULL)
 #endif
 		bim = lookup_bootinfo(BTINFO_MEMMAP);
 	if (bim == NULL)

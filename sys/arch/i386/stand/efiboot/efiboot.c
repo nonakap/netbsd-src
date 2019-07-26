@@ -43,6 +43,7 @@ bool efi_cleanuped;
 static EFI_PHYSICAL_ADDRESS heap_start = EFI_ALLOCATE_MAX_ADDRESS;
 static UINTN heap_size = 1 * 1024 * 1024;			/* 1MB */
 static struct btinfo_efi btinfo_efi;
+static struct btinfo_efimemmap2 btinfo_emm2;
 
 static void efi_heap_init(void);
 
@@ -134,6 +135,14 @@ efi_cleanup(void)
 			panic("ExitBootServices failed");
 	}
 	efi_cleanuped = true;
+
+	btinfo_emm2.num = NoEntries;
+	btinfo_emm2.version = DescriptorVersion;
+	btinfo_emm2.size = DescriptorSize;
+	btinfo_emm2.memmap_start = image_add(desc, NoEntries * DescriptorSize);
+	btinfo_emm2.memmap_end = btinfo_emm2.memmap_start +
+	    NoEntries * DescriptorSize;
+	BI_ADD(&btinfo_emm2, BTINFO_EFIMEMMAP2, sizeof(btinfo_emm2));
 
 	efi_memory_compact_map(desc, &NoEntries, DescriptorSize);
 	allocsz = sizeof(struct btinfo_efimemmap) - 1

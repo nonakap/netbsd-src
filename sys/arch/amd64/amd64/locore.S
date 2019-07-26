@@ -333,6 +333,8 @@
 	.globl	_C_LABEL(biosbasemem)
 	.globl	_C_LABEL(biosextmem)
 	.globl	_C_LABEL(lwp0uarea)
+	.globl	_C_LABEL(efimemmap_start)
+	.globl	_C_LABEL(efimemmap_end)
 	.globl	do_mov_es
 	.globl	do_mov_ds
 	.globl	do_mov_fs
@@ -380,6 +382,12 @@ END(biosextmem)
 	.type	_C_LABEL(lwp0uarea), @object
 LABEL(lwp0uarea)	.quad	0
 END(lwp0uarea)
+	.type	_C_LABEL(efimemmap_start), @object
+LABEL(efimemmap_start)	.quad	0
+END(efimemmap_start)
+	.type	_C_LABEL(efimemmap_end), @object
+LABEL(efimemmap_end)	.quad	0
+END(efimemmap_end)
 
 #ifndef XENPV
 	.globl	gdt64_lo
@@ -486,7 +494,7 @@ ENTRY(start)
 	 * later to compute the initial bootstrap tables.
 	 */
 	cmpl	$BTINFO_MODULELIST,4(%esi) /* btinfo_common::type */
-	jne	.Lbootinfo_copy
+	jne	.Lbootinfo_efimemmap
 
 	/* Skip the modules if we won't have enough VA to map them */
 	movl	12(%esi),%eax		/* btinfo_modulelist::endpa */
@@ -497,6 +505,26 @@ ENTRY(start)
 	movl	%eax,RELOC(eblob)
 	addl	$KERNBASE_LO,RELOC(eblob)
 	adcl	$KERNBASE_HI,RELOC(eblob)+4
+
+.Lbootinfo_efimemmap:
+	/* Record the information about the UEFI memory maps. */
+	cmpl	$BTINFO_EFIMEMMAP2,4(%esi) /* btinfo_common::type */
+	jne	.Lbootinfo_copy
+
+	/* Skip the UEFI memory maps if we won't have enough VA to map them */
+	movl	24(%esi),%eax		/* btinfo_efimemmap2::memmap_end */
+	addl	$PGOFSET,%eax		/* roundup to a page */
+	andl	$~PGOFSET,%eax
+	cmpl	$BOOTMAP_VA_SIZE,%eax
+	jg	.Lbootinfo_skip
+	movl	%eax,RELOC(efimemmap_end)
+	addl	$KERNBASE_LO,RELOC(efimemmap_end)
+	adcl	$KERNBASE_HI,RELOC(efimemmap_end)+4
+
+	movl	20(%esi),%eax		/* btinfo_efimemmap2::memmap_start */
+	movl	%eax,RELOC(efimemmap_start)
+	addl	$KERNBASE_LO,RELOC(efimemmap_start)
+	adcl	$KERNBASE_HI,RELOC(efimemmap_start)+4
 
 .Lbootinfo_copy:
 	rep
@@ -600,15 +628,15 @@ ENTRY(start)
  * be referred to as: L4 -> L3 -> L2 -> L1.
  *
  * Virtual address space of the kernel:
- * +------+--------+------+-----+--------+---------------------+----------
- * | TEXT | RODATA | DATA | BSS | [SYMS] | [PRELOADED MODULES] | L4 ->
- * +------+--------+------+-----+--------+---------------------+----------
+ * +------+--------+------+-----+--------+---------------------+-------
+ * | TEXT | RODATA | DATA | BSS | [SYMS] | [PRELOADED MODULES] | [UEFI
+ * +------+--------+------+-----+--------+---------------------+-------
  *                             (1)      (2)                   (3)
  *
- * --------------+-----+-----+----+-------------+
- * -> PROC0 STK -> L3 -> L2 -> L1 | ISA I/O MEM |
- * --------------+-----+-----+----+-------------+
- *                               (4)
+ * -------------+-----+------------+-----+-----+----+-------------+
+ * MEMORY MAPS] | L4 -> PROC0 STK -> L3 -> L2 -> L1 | ISA I/O MEM |
+ * -------------+-----+------------+-----+-----+----+-------------+
+ *             (4)                                 (5)
  *
  * PROC0 STK is obviously not linked as a page level. It just happens to be
  * caught between L4 and L3.
@@ -635,6 +663,14 @@ ENTRY(start)
 #endif
 	/* Skip over any modules/blobs; brings us on (3). */
 	movl	RELOC(eblob),%eax
+	testl	%eax,%eax
+	jz	1f
+	subl	$KERNBASE_LO,%eax	/* XXX */
+	movl	%eax,%edi
+1:
+
+	/* Skip over UEFI memory maps; brings us on (4). */
+	movl	RELOC(efimemmap_end),%eax
 	testl	%eax,%eax
 	jz	1f
 	subl	$KERNBASE_LO,%eax	/* XXX */
@@ -699,7 +735,7 @@ ENTRY(start)
 	orl	$(PTE_P|PTE_W),%eax
 	fillkpt_nox
 
-	/* Map [SYMS]+[PRELOADED MODULES] RW. */
+	/* Map [SYMS]+[PRELOADED MODULES]+[UEFI MEMORY MAPS] RW. */
 	movl	$RELOC(__kernel_end),%eax
 	movl	%esi,%ecx		/* start of BOOTSTRAP TABLES */
 	subl	%eax,%ecx
@@ -714,7 +750,7 @@ ENTRY(start)
 	orl	$(PTE_P|PTE_W),%eax
 	fillkpt_nox
 
-	/* We are on (4). Map ISA I/O MEM RW. */
+	/* We are on (5). Map ISA I/O MEM RW. */
 	movl	$IOM_BEGIN,%eax
 	movl	$IOM_SIZE,%ecx	/* size of ISA I/O MEM */
 	shrl	$PGSHIFT,%ecx

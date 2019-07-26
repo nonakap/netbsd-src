@@ -289,6 +289,8 @@ __KERNEL_RCSID(0, "$NetBSD: locore.S,v 1.168 2019/05/19 08:17:02 maxv Exp $");
 	.globl	_C_LABEL(atdevbase)
 	.globl	_C_LABEL(PDPpaddr)
 	.globl	_C_LABEL(lwp0uarea)
+	.globl	_C_LABEL(efimemmap_start)
+	.globl	_C_LABEL(efimemmap_end)
 	.globl	_C_LABEL(gdt)
 	.globl	_C_LABEL(idt)
 
@@ -313,6 +315,12 @@ END(lwp0uarea)
 	.type	_C_LABEL(PDPpaddr), @object
 LABEL(PDPpaddr)		.long	0	/* paddr of PDP, for libkvm */
 END(PDPpaddr)
+	.type	_C_LABEL(efimemmap_start), @object
+LABEL(efimemmap_start)	.long	0
+END(efimemmap_start)
+	.type	_C_LABEL(efimemmap_end), @object
+LABEL(efimemmap_end)	.long	0
+END(efimemmap_end)
 
 	/* Space for the temporary stack */
 	.size	tmpstk, tmpstk - .
@@ -595,15 +603,15 @@ no_NOX:
  * 	+-----+-----+------------+----+
  *
  * Virtual address space of the kernel in both cases:
- * +------+--------+------+-----+--------+---------------------+-----------
- * | TEXT | RODATA | DATA | BSS | [SYMS] | [PRELOADED MODULES] | BOOTSTRAP
- * +------+--------+------+-----+--------+---------------------+-----------
+ * +------+--------+------+-----+--------+---------------------+-------------
+ * | TEXT | RODATA | DATA | BSS | [SYMS] | [PRELOADED MODULES] | [UEFI MEMORY
+ * +------+--------+------+-----+--------+---------------------+-------------
  *                             (1)      (2)                   (3)
  *
- * -------+-------------+
- * TABLES | ISA I/O MEM |
- * -------+-------------+
- *       (4)
+ * ------+------------------+-------------+
+ * MAPS] | BOOTSTRAP TABLES | ISA I/O MEM |
+ * ------+------------------+-------------+
+ *      (4)                (5)
  *
  * PROC0 STK is obviously not linked as a page level. It just happens to be
  * caught between L2 and L1.
@@ -627,6 +635,14 @@ no_NOX:
 
 	/* Skip over any modules/blobs; brings us on (3). */
 	movl	RELOC(eblob),%eax
+	testl	%eax,%eax
+	jz	1f
+	subl	$KERNBASE,%eax
+	movl	%eax,%edi
+1:
+
+	/* Skip over UEFI memory maps; brings us on (4). */
+	movl	RELOC(efimemmap_end),%eax
 	testl	%eax,%eax
 	jz	1f
 	subl	$KERNBASE,%eax
@@ -712,7 +728,7 @@ no_NOX:
 	orl	$(PTE_P|PTE_W),%eax
 	fillkpt_nox
 
-	/* Map [SYMS]+[PRELOADED MODULES] RW. */
+	/* Map [SYMS]+[PRELOADED MODULES]+[UEFI MEMORY MAPS] RW. */
 	movl	$RELOC(__kernel_end),%eax
 	movl	%esi,%ecx		/* start of BOOTSTRAP TABLES */
 	subl	%eax,%ecx
@@ -727,7 +743,7 @@ no_NOX:
 	orl	$(PTE_P|PTE_W),%eax
 	fillkpt_nox
 
-	/* We are on (4). Map ISA I/O MEM RW. */
+	/* We are on (5). Map ISA I/O MEM RW. */
 	movl	$IOM_BEGIN,%eax
 	movl	$IOM_SIZE,%ecx	/* size of ISA I/O MEM */
 	shrl	$PGSHIFT,%ecx

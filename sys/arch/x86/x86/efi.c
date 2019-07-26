@@ -61,6 +61,7 @@ static paddr_t efi_systbl_pa;
 static struct efi_systbl *efi_systbl_va = NULL;
 static struct efi_cfgtbl *efi_cfgtblhead_va = NULL;
 static struct efi_e820memmap {
+	int type;
 	struct btinfo_memmap bim;
 	struct bi_memmap_entry entry[VM_PHYSSEG_MAX - 1];
 } efi_e820memmap;
@@ -424,6 +425,14 @@ efi_init(void)
 #if NPCI > 0	
 	pci_mapreg_map_enable_decode = true; /* PR port-amd64/53286 */
 #endif
+
+	if (efi_get_e820memmap() != NULL)
+		aprint_debug("efi: using BTINFO_EFIMEMMAP%s\n",
+		    efi_e820memmap.type == BTINFO_EFIMEMMAP2 ? "2" : "");
+	else if (lookup_bootinfo(BTINFO_MEMMAP) != NULL)
+		aprint_debug("efi: using BTINFO_MEMMAP\n");
+	else
+		aprint_error("efi: missing memory maps\n");
 }
 
 bool
@@ -492,27 +501,19 @@ efi_getmemtype_str(uint32_t type)
 	return "unknown";
 }
 
-struct btinfo_memmap *
-efi_get_e820memmap(void)
+static struct btinfo_memmap *
+efi_convert_efimemmap(const uint8_t *mdtop, uint32_t mdnum, uint32_t mdsize)
 {
-	struct btinfo_efimemmap *efimm;
 	struct bi_memmap_entry *entry;
-	struct efi_md *md;
+	const struct efi_md *md;
 	uint64_t addr, size;
 	uint64_t start_addr = 0;        /* XXX gcc -Os: maybe-uninitialized */
 	uint64_t end_addr = 0;          /* XXX gcc -Os: maybe-uninitialized */
 	uint32_t i;
 	int n, type, seg_type = -1;
 
-	if (efi_e820memmap.bim.common.type == BTINFO_MEMMAP)
-		return &efi_e820memmap.bim;
-
-	efimm = lookup_bootinfo(BTINFO_EFIMEMMAP);
-	if (efimm == NULL)
-		return NULL;
-
-	for (n = 0, i = 0; i < efimm->num; i++) {
-		md = (struct efi_md *)(efimm->memmap + efimm->size * i);
+	for (n = 0, i = 0; i < mdnum; i++) {
+		md = (const struct efi_md *)(mdtop + mdsize * i);
 		addr = md->md_phys;
 		size = md->md_pages * EFI_PAGE_SIZE;
 		type = efi_getbiosmemtype(md->md_type, md->md_attr);
@@ -563,4 +564,57 @@ efi_get_e820memmap(void)
 	    (intptr_t)&efi_e820memmap.bim.entry[n] - (intptr_t)&efi_e820memmap;
 	efi_e820memmap.bim.common.type = BTINFO_MEMMAP;
 	return &efi_e820memmap.bim;
+}
+
+static struct btinfo_memmap *
+efi_convert_efimemmap1(void)
+{
+	struct btinfo_efimemmap *efimm;
+	struct btinfo_memmap *bim;
+
+	efimm = lookup_bootinfo(BTINFO_EFIMEMMAP);
+	if (efimm == NULL)
+		return NULL;
+
+	bim = efi_convert_efimemmap(efimm->memmap, efimm->num, efimm->size);
+	if (bim == NULL)
+		return NULL;
+
+	efi_e820memmap.type = BTINFO_EFIMEMMAP;
+	return bim;
+}
+
+static struct btinfo_memmap *
+efi_convert_efimemmap2(void)
+{
+	extern char *efimemmap_start, *efimemmap_end;
+	struct btinfo_efimemmap2 *efimm2;
+	struct btinfo_memmap *bim;
+
+	if (efimemmap_start == NULL || efimemmap_end == NULL)
+		return NULL;
+
+	efimm2 = lookup_bootinfo(BTINFO_EFIMEMMAP2);
+	if (efimm2 == NULL)
+		return NULL;
+
+	bim = efi_convert_efimemmap((uint8_t *)efimemmap_start, efimm2->num,
+	    efimm2->size);
+	if (bim == NULL)
+		return NULL;
+
+	efi_e820memmap.type = BTINFO_EFIMEMMAP2;
+	return bim;
+}
+
+struct btinfo_memmap *
+efi_get_e820memmap(void)
+{
+
+	if (efi_e820memmap.bim.common.type == BTINFO_MEMMAP ||
+	    efi_convert_efimemmap2() != NULL ||
+	    efi_convert_efimemmap1() != NULL)
+		return &efi_e820memmap.bim;
+
+	return NULL;
 }

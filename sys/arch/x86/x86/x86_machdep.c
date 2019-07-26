@@ -663,7 +663,7 @@ x86_parse_clusters(struct btinfo_memmap *bim)
 
 #ifdef DEBUG_MEMLOAD
 	printf("MEMMAP: %s MEMORY MAP (%d ENTRIES):\n",
-	    lookup_bootinfo(BTINFO_EFIMEMMAP) != NULL ? "UEFI" : "BIOS",
+	    efi_get_e820memmap() != NULL ? "UEFI" : "BIOS",
 	    bim->num);
 #endif
 
@@ -840,7 +840,6 @@ void
 init_x86_clusters(void)
 {
 	struct btinfo_memmap *bim;
-	struct btinfo_efimemmap *biem;
 
 	/*
 	 * Check to see if we have a memory map from the BIOS (passed to us by
@@ -848,25 +847,21 @@ init_x86_clusters(void)
 	 */
 #ifdef i386
 	extern int biosmem_implicit;
-	biem = lookup_bootinfo(BTINFO_EFIMEMMAP);
-	if (biem != NULL)
-		bim = efi_get_e820memmap();
-	else
+	bim = efi_get_e820memmap();
+	if (bim == NULL)
 		bim = lookup_bootinfo(BTINFO_MEMMAP);
 	if ((biosmem_implicit || (biosbasemem == 0 && biosextmem == 0)) &&
 	    bim != NULL && bim->num > 0)
 		x86_parse_clusters(bim);
 #else
 #if !defined(REALBASEMEM) && !defined(REALEXTMEM)
-	biem = lookup_bootinfo(BTINFO_EFIMEMMAP);
-	if (biem != NULL)
-		bim = efi_get_e820memmap();
-	else
+	bim = efi_get_e820memmap();
+	if (bim == NULL)
 		bim = lookup_bootinfo(BTINFO_MEMMAP);
 	if (bim != NULL && bim->num > 0)
 		x86_parse_clusters(bim);
 #else
-	(void)bim, (void)biem;
+	(void)bim;
 #endif
 #endif
 

@@ -257,6 +257,7 @@ extern int time_adjusted;
 
 int *esym;
 int *eblob;
+extern char *efimemmap_start, *efimemmap_end;
 extern int boothowto;
 
 #ifndef XENPV
@@ -331,7 +332,11 @@ native_loader(int bl_boothowto, int bl_bootdev,
 		size_t i;
 		uint8_t *data;
 		struct bootinfo *bidest;
-		struct btinfo_modulelist *bi;
+		union btinfo {
+			struct btinfo_common common;
+			struct btinfo_modulelist ml;
+			struct btinfo_efimemmap2 emm2;
+		} *bi;
 
 		bidest = RELOC(struct bootinfo *, &bootinfo);
 
@@ -347,14 +352,22 @@ native_loader(int bl_boothowto, int bl_bootdev,
 				break;
 
 			memcpy(data, bc, bc->len);
-			/*
-			 * If any modules were loaded, record where they
-			 * end.  We'll need to skip over them.
-			 */
-			bi = (struct btinfo_modulelist *)data;
-			if (bi->common.type == BTINFO_MODULELIST) {
+			bi = (union btinfo *)data;
+			switch (bi->common.type) {
+			case BTINFO_MODULELIST:
+				/*
+				 * If any modules were loaded, record where they
+				 * end.  We'll need to skip over them.
+				 */
 				*RELOC(int **, &eblob) =
-				    (int *)(bi->endpa + KERNBASE);
+				    (int *)(bi->ml.endpa + KERNBASE);
+				break;
+			case BTINFO_EFIMEMMAP2:
+				*RELOC(char **, &efimemmap_start) =
+				    (char *)(bi->emm2.memmap_start + KERNBASE);
+				*RELOC(char **, &efimemmap_end) =
+				    (char *)(bi->emm2.memmap_end + KERNBASE);
+				break;
 			}
 			data += bc->len;
 		}

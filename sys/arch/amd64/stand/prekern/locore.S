@@ -134,6 +134,7 @@
 	.globl	_C_LABEL(stkva)
 	.globl	_C_LABEL(kernpa_start)
 	.globl	_C_LABEL(kernpa_end)
+	.globl	_C_LABEL(efimemmap_end)
 
 	.type	_C_LABEL(tablesize), @object
 _C_LABEL(tablesize):	.long	TABLESIZE
@@ -174,6 +175,9 @@ END(kernpa_start)
 	.type	_C_LABEL(kernpa_end), @object
 LABEL(kernpa_end)	.quad	0
 END(kernpa_end)
+	.type	_C_LABEL(efimemmap_end), @object
+LABEL(efimemmap_end)	.quad	0
+END(efimemmap_end)
 
 	.globl	gdt64_lo
 	.globl	gdt64_start
@@ -263,6 +267,13 @@ ENTRY(start)
 	popl	_C_LABEL(eblob)
 0:
 
+	/* Record the information about the UEFI memory maps. */
+	cmpl	$BTINFO_EFIMEMMAP2,4(%esi) /* btinfo_common::type */
+	jne	0f
+	pushl	24(%esi)		/* btinfo_efimemmap2::memmap_end */
+	popl	_C_LABEL(efimemmap_end)
+0:
+
 	/* Record the information about the kernel. */
 	cmpl	$BTINFO_PREKERN,4(%esi) /* btinfo_common::type */
 	jne	0f
@@ -342,10 +353,10 @@ ENTRY(start)
  * | PREKERN IMAGE |**UNUSED**| KERNEL IMAGE | [SYMS] | [PRELOADED MODULES] |
  * +---------------+----------+--------------+--------+---------------------+-
  *                (1)                       (2)      (3)                   (4)
- * ------------------+
- *  BOOTSTRAP TABLES |
- * ------------------+
- *                  (5)
+ * --------------------+------------------+
+ *  [UEFI MEMORY MAPS] | BOOTSTRAP TABLES |
+ * --------------------+------------------+
+ *                    (5)                (6)
  *
  * The virtual address space is the same, since it is identity-mapped (va = pa).
  * However, the KERNEL IMAGE is mapped as read-only: the prekern reads it, but
@@ -379,6 +390,13 @@ ENTRY(start)
 
 	/* Find end of the kernel preloaded modules; brings us on (4). */
 	movl	_C_LABEL(eblob),%eax
+	testl	%eax,%eax
+	jz	1f
+	movl	%eax,%edi
+1:
+
+	/* Find end of the UEFI memory maps; brings us on (5). */
+	movl	_C_LABEL(efimemmap_end),%eax
 	testl	%eax,%eax
 	jz	1f
 	movl	%eax,%edi

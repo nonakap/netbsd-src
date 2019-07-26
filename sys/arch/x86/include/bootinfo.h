@@ -41,10 +41,12 @@
 #define BTINFO_EFI		14
 #define BTINFO_EFIMEMMAP	15
 #define BTINFO_PREKERN		16
+#define BTINFO_EFIMEMMAP2	17
 
 #define BTINFO_STR "bootpath", "rootdevice", "bootdisk", "netif", \
     "console", "biosgeom", "symtab", "memmap", "bootwedge", "modulelist", \
-    "framebuffer", "userconfcommands", "efi", "efimemmap", "prekern",
+    "framebuffer", "userconfcommands", "efi", "efimemmap", "prekern", \
+    "efimemmap2",
 
 #ifndef _LOCORE
 
@@ -245,6 +247,15 @@ struct btinfo_efimemmap {
 	uint32_t version;	/* version of memory descriptor */
 	uint32_t size;		/* size of memory descriptor */
 	uint8_t memmap[1];	/* whole memory descriptors */
+};
+
+struct btinfo_efimemmap2 {
+	struct btinfo_common common;
+	uint32_t num;		/* number of memory descriptor */
+	uint32_t version;	/* version of memory descriptor */
+	uint32_t size;		/* size of memory descriptor */
+	uint32_t memmap_start;
+	uint32_t memmap_end;
 };
 
 #endif /* _LOCORE */

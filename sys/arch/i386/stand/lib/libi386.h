@@ -144,6 +144,7 @@ void splash_add(char *);
 void rnd_add(char *);
 void fs_add(char *);
 void userconf_add(char *);
+uint32_t image_add(void *, size_t);
 void module_add_split(const char *, uint8_t);
 
 struct btinfo_framebuffer;

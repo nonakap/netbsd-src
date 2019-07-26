@@ -303,6 +303,19 @@ userconf_add(char *cmd)
 	}
 }
 
+uint32_t
+image_add(void *buf, size_t len)
+{
+	uint32_t top;
+
+	image_end = (image_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	memcpy((void *)(uintptr_t)image_end, buf, len);
+	top = image_end;
+	image_end += len;
+
+	return top;
+}
+
 struct btinfo_prekern bi_prekern;
 int has_prekern = 0;
 
