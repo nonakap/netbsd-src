@@ -263,12 +263,15 @@ ENTRY(mutex_spin_exit)
 	incl	CPUVAR(MTX_COUNT)
 	movb	$0, MTX_LOCK(%edx)		/* zero */
 	jnz	1f
-	movl	%fs:CPU_INFO_IUNMASK(,%ecx,4), %edx
+	movl	CPUVAR(IUNMASK)(,%ecx,8), %edx
+	movl	CPUVAR(IUNMASK)+4(,%ecx,8), %eax
 	cli
 	testl	CPUVAR(IPENDING), %edx
 	movl    %ecx, 4(%esp)
 	jnz	_C_LABEL(Xspllower)		/* does sti */
-	movl	%ecx, CPUVAR(ILEVEL)
+	testl	CPUVAR(IPENDING)+4, %eax
+	jnz	_C_LABEL(Xspllower)		/* does sti */
+	movb	%cl, CPUVAR(ILEVEL)
 	sti
 1:	ret
 	.space 32
@@ -284,20 +287,36 @@ ENTRY(i686_mutex_spin_exit)
 	mov	4(%esp),%edx
 	movl	CPUVAR(MTX_OLDSPL), %ecx
 	incl	CPUVAR(MTX_COUNT)
-	movb	%ch, MTX_LOCK(%edx)		/* zero */
+	movb	$0, MTX_LOCK(%edx)		/* zero */
 	jnz	1f
 	pushl	%ebx
+	pushl	%esi
+	pushl	%edi
+	movl	%ecx, %esi
+	movl	%ecx, %edi
+	shll	$24, %edi
 0:
 	movl	CPUVAR(IPENDING), %eax
-	testl	%eax, %fs:CPU_INFO_IUNMASK(,%ecx,4)
+	testl	%eax, CPUVAR(IUNMASK)(,%esi,8)
+	jnz	2f
+	movl	CPUVAR(IPENDING)+4, %edx
+	testl	%edx, CPUVAR(IUNMASK)+4(,%esi,8)
 	jnz	2f
 	movl	%eax, %ebx
+	movl	%edx, %ecx
+	andl	$0x00ffffff, %ecx
+	orl	%edi, %ecx
 	cmpxchg8b CPUVAR(ISTATE)		/* swap in new ilevel */
 	jnz	0b
+	popl	%edi
+	popl	%esi
 	popl	%ebx
 1:
 	ret
 2:
+	movl	%esi,%ecx
+	popl	%edi
+	popl	%esi
 	popl	%ebx
 	movl	%ecx,4(%esp)
 LABEL(i686_mutex_spin_exit_patch)

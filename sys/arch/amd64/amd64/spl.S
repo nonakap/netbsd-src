@@ -82,10 +82,10 @@
  * int splraise(int s);
  */
 ENTRY(splraise)
-	movl	CPUVAR(ILEVEL),%eax
+	movzbl	CPUVAR(ILEVEL),%eax
 	cmpl	%edi,%eax
 	cmoval	%eax,%edi
-	movl	%edi,CPUVAR(ILEVEL)
+	movb	%dil,CPUVAR(ILEVEL)
 	ret
 END(splraise)
 
@@ -110,7 +110,7 @@ IDTVEC(softintr)
 	pushq	%r14
 	pushq	%r15
 
-	movl	$IPL_HIGH,CPUVAR(ILEVEL)
+	movb	$IPL_HIGH,CPUVAR(ILEVEL)
 	movq	CPUVAR(CURLWP),%r15
 	movq	IS_LWP(%rax),%rdi	/* switch to handler LWP */
 	movq	L_PCB(%rdi),%rdx
@@ -173,7 +173,9 @@ END(softintr_ret)
  * Software interrupt registration.
  */
 ENTRY(softint_trigger)
-	orl	%edi,CPUVAR(IPENDING)	/* atomic on local cpu */
+	shlq	$8,%rdi			/* clear upper 8 bits */
+	shrq	$8,%rdi
+	orq	%rdi,CPUVAR(IPENDING)	/* atomic on local cpu */
 	ret
 END(softint_trigger)
 
@@ -184,7 +186,7 @@ END(softint_trigger)
  * Handles preemption interrupts via Xspllower().
  */
 IDTVEC(recurse_preempt)
-	movl	$IPL_PREEMPT,CPUVAR(ILEVEL)
+	movb	$IPL_PREEMPT,CPUVAR(ILEVEL)
 	sti
 	xorq	%rdi,%rdi
 	call	_C_LABEL(kpreempt)
@@ -198,7 +200,7 @@ IDTVEC_END(recurse_preempt)
  * Handles preemption interrupts via Xdoreti().
  */
 IDTVEC(resume_preempt)
-	movl	$IPL_PREEMPT,CPUVAR(ILEVEL)
+	movb	$IPL_PREEMPT,CPUVAR(ILEVEL)
 	sti
 	testq	$SEL_RPL,TF_CS(%rsp)
 	jnz	1f
@@ -222,14 +224,14 @@ IDTVEC_END(resume_preempt)
  * are disabled via eflags/IE.
  */
 ENTRY(spllower)
-	cmpl	CPUVAR(ILEVEL),%edi
+	cmpb	CPUVAR(ILEVEL),%dil
 	jae	1f
-	movl	CPUVAR(IUNMASK)(,%rdi,4),%edx
+	movq	CPUVAR(IUNMASK)(,%rdi,8),%rdx
 	pushf
 	cli
-	testl	CPUVAR(IPENDING),%edx
+	testq	CPUVAR(IPENDING),%rdx
 	jnz	2f
-	movl	%edi,CPUVAR(ILEVEL)
+	movb	%dil,CPUVAR(ILEVEL)
 	popf
 1:
 	ret
@@ -238,41 +240,39 @@ ENTRY(spllower)
 	popf
 	jmp	_C_LABEL(Xspllower)
 3:
-	.space 16
+	.space 24
 	.align	16
 END(spllower)
 LABEL(spllower_end)
 
 /*
  * void	cx8_spllower(int s);
- *
- * For cmpxchg8b, edx/ecx are the high words and eax/ebx the low.
- *
- * edx : eax = old level / old ipending
- * ecx : ebx = new level / old ipending
  */
 ENTRY(cx8_spllower)
-	movl	CPUVAR(ILEVEL),%edx
-	movq	%rbx,%r8
+	movzbl	CPUVAR(ILEVEL),%edx
 	cmpl	%edx,%edi			/* new level is lower? */
 	jae	1f
+	xorq	%rcx,%rcx			/* rcx: ci_ipending mask */
+	notq	%rcx
+	shrq	$8,%rcx
+	movq	%rdi,%r9			/* r9: shifted new level */
+	shlq	$56,%r9
 0:
-	movl	CPUVAR(IPENDING),%eax
-	movl	%edi,%ecx
-	testl	%eax,CPUVAR(IUNMASK)(,%rcx,4)/* deferred interrupts? */
-	movl	%eax,%ebx
+	movq	CPUVAR(IPENDING),%rax
+	testq	%rax,CPUVAR(IUNMASK)(,%rdi,8)	/* deferred interrupts? */
 	/*
 	 * On the P4 this jump is cheaper than patching in junk
 	 * using cmov.  Is cmpxchg expensive if it fails?
 	 */
 	jnz	2f
-	cmpxchg8b CPUVAR(ISTATE)		/* swap in new ilevel */
+	movq	%rax,%r8
+	andq	%rcx,%r8
+	orq	%r9,%r8
+	cmpxchgq %r8,CPUVAR(ISTATE)		/* swap in new ilevel */
 	jnz	0b
 1:
-	movq	%r8,%rbx
 	ret
 2:
-	movq	%r8,%rbx
 	.type	_C_LABEL(cx8_spllower_patch), @function
 LABEL(cx8_spllower_patch)
 	jmp	_C_LABEL(Xspllower)
@@ -311,12 +311,12 @@ IDTVEC(spllower)
 	leaq	1f(%rip),%r13		/* address to resume loop at */
 1:	movl	%ebx,%eax		/* get cpl */
 #if !defined(XENPV)
-	movl	CPUVAR(IUNMASK)(,%rax,4),%eax
+	movq	CPUVAR(IUNMASK)(,%rax,8),%rax
 	CLI(si)
-	andl	CPUVAR(IPENDING),%eax	/* any non-masked bits left? */
+	andq	CPUVAR(IPENDING),%rax	/* any non-masked bits left? */
 	jz	2f
-	bsrl	%eax,%eax
-	btrl	%eax,CPUVAR(IPENDING)
+	bsrq	%rax,%rax
+	btrq	%rax,CPUVAR(IPENDING)
 	movq	CPUVAR(ISOURCES)(,%rax,8),%rax
 	jmp	*IS_RECURSE(%rax)
 #endif
@@ -332,7 +332,7 @@ IDTVEC(spllower)
 	jmp	*IS_RECURSE(%rax)
 #endif
 3:
-	movl	%ebx,CPUVAR(ILEVEL)
+	movb	%bl,CPUVAR(ILEVEL)
 	STI(si)
 	popq	%r12
 	popq	%r13
@@ -355,12 +355,12 @@ IDTVEC(doreti)
 	leaq	1f(%rip),%r13
 1:	movl	%ebx,%eax
 #if !defined(XENPV)
-	movl	CPUVAR(IUNMASK)(,%rax,4),%eax
+	movq	CPUVAR(IUNMASK)(,%rax,8),%rax
 	CLI(si)
-	andl	CPUVAR(IPENDING),%eax
+	andq	CPUVAR(IPENDING),%rax
 	jz	2f
-	bsrl	%eax,%eax		/* slow, but not worth optimizing */
-	btrl	%eax,CPUVAR(IPENDING)
+	bsrq	%rax,%rax		/* slow, but not worth optimizing */
+	btrq	%rax,CPUVAR(IPENDING)
 	movq	CPUVAR(ISOURCES)(,%rax,8),%rax
 	jmp	*IS_RESUME(%rax)
 #endif
@@ -376,7 +376,7 @@ IDTVEC(doreti)
 	jmp	*IS_RESUME(%rax)
 #endif
 3:	/* Check for ASTs on exit to user mode. */
-	movl	%ebx,CPUVAR(ILEVEL)
+	movb	%bl,CPUVAR(ILEVEL)
 5:
 	testb	$SEL_RPL,TF_CS(%rsp)
 	jz	6f

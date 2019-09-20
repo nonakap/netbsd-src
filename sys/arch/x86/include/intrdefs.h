@@ -25,9 +25,9 @@
  * Local APIC masks and software interrupt masks, in order
  * of priority.  Must not conflict with SIR_* below.
  */
-#define LIR_IPI		31
-#define LIR_TIMER	30
-#define LIR_HV		29
+#define LIR_IPI		55
+#define LIR_TIMER	54
+#define LIR_HV		53
 
 /*
  * XXX These should be lowest numbered, but right now would
@@ -42,12 +42,12 @@
 #define	SIR_PREEMPT	24
 
 /*
- * Maximum # of interrupt sources per CPU. 32 to fit in one word.
+ * Maximum # of interrupt sources per CPU. Bitmask must still fit in one quad.
  * ioapics can theoretically produce more, but it's not likely to
  * happen. For multiple ioapics, things can be routed to different
  * CPUs.
  */
-#define MAX_INTR_SOURCES	32
+#define MAX_INTR_SOURCES	56
 #define NUM_LEGACY_IRQS		16
 
 /*

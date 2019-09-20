@@ -344,7 +344,7 @@ IDTVEC(trap07)
 	ZTRAP_NJ(T_DNA)
 	INTRENTRY
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	movq	%rsp,%rdi
 	call	_C_LABEL(fpudna)
@@ -436,7 +436,7 @@ IDTVEC(trap15)
 	ZTRAP_NJ(T_ASTFLT)
 	INTRENTRY
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	jmp	.Lalltraps_checkusr
 IDTVEC_END(trap15)
@@ -446,7 +446,7 @@ IDTVEC(trap16)
 .Ldo_fputrap:
 	INTRENTRY
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	movq	%rsp,%rdi
 	call	_C_LABEL(fputrap)
@@ -497,7 +497,7 @@ IDTVEC(intrspurious)
 	ZTRAP_NJ(T_ASTFLT)
 	INTRENTRY
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	jmp	.Lalltraps_checkusr
 IDTVEC_END(intrspurious)
@@ -647,7 +647,7 @@ ENTRY(alltraps)
 
 calltrap:
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	movq	%rsp,%rdi
 	incq	CPUVAR(NTRAP)
@@ -675,7 +675,7 @@ calltrap:
 
 6:
 #ifdef DIAGNOSTIC
-	cmpl	CPUVAR(ILEVEL),%ebx
+	cmpb	CPUVAR(ILEVEL),%bl
 	jne	.Lspl_error
 #endif
 	INTRFASTEXIT
@@ -688,7 +688,7 @@ calltrap:
 .Lspl_error:
 	STI(si)
 	movabsq	$4f,%rdi
-	movl	CPUVAR(ILEVEL),%esi
+	movzbl	CPUVAR(ILEVEL),%esi
 	movl	%ebx,%edx
 	xorq	%rax,%rax
 	call	_C_LABEL(printf)

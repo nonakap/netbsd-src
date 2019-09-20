@@ -114,7 +114,10 @@ patchfunc(void *from_s, void *from_e, void *to_s, void *to_e,
 
 	if ((uintptr_t)from_e - (uintptr_t)from_s !=
 	    (uintptr_t)to_e - (uintptr_t)to_s)
-		panic("patchfunc: sizes do not match (from=%p)", from_s);
+		panic("patchfunc: sizes do not match "
+		    "(from=%p, from size=%td, to size=%td)",from_s,
+		    (char *)from_e - (char *)from_s,
+		    (char *)to_e - (char *)to_s);
 
 	memcpy(to_s, from_s, (uintptr_t)to_e - (uintptr_t)to_s);
 	if (pcrel != NULL)
