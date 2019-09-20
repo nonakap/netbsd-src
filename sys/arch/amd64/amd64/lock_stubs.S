@@ -91,11 +91,11 @@ END(mutex_exit)
  */
 ENTRY(mutex_spin_enter)
 	movl	$1, %eax
-	movl	CPUVAR(ILEVEL), %esi
+	movzbl	CPUVAR(ILEVEL), %esi
 	movzbl	MTX_IPL(%rdi), %ecx		/* new SPL */
 	cmpl	%ecx, %esi			/* higher? */
 	cmovgl	%esi, %ecx
-	movl	%ecx, CPUVAR(ILEVEL)		/* splraiseipl() */
+	movb	%cl, CPUVAR(ILEVEL)		/* splraiseipl() */
 	subl	%eax, CPUVAR(MTX_COUNT)		/* decl doesnt set CF */
 	cmovncl	CPUVAR(MTX_OLDSPL), %esi
 	movl	%esi, CPUVAR(MTX_OLDSPL)
@@ -124,12 +124,14 @@ ENTRY(mutex_spin_exit)
 	movl	CPU_INFO_MTX_OLDSPL(%r8), %edi
 	incl	CPU_INFO_MTX_COUNT(%r8)
 	jnz	1f
-	cmpl	CPU_INFO_ILEVEL(%r8), %edi
+	cmpb	CPU_INFO_ILEVEL(%r8), %dil
 	jae	1f
 #if !defined(XENPV)
-	movl	CPU_INFO_IUNMASK(%r8,%rdi,4), %esi
+	movq	CPU_INFO_IUNMASK(%r8,%rdi,8), %rsi
 	CLI(ax)
-	testl	CPU_INFO_IPENDING(%r8), %esi
+	movq	CPU_INFO_ISTATE(%r8), %rax
+	shrq	$CPU_INFO_IPENDING_SHIFT,%rax
+	testq	%rax, %rsi
 	jnz	_C_LABEL(Xspllower)
 #endif
 #if defined(XEN)
@@ -138,44 +140,44 @@ ENTRY(mutex_spin_exit)
 	testl	CPU_INFO_XPENDING(%r8), %esi
 	jnz	_C_LABEL(Xspllower)
 #endif
-	movl	%edi, CPU_INFO_ILEVEL(%r8)
+	movb	%dil, CPU_INFO_ILEVEL(%r8)
 	STI(ax)
 1:	rep					/* double byte ret as branch */
 	ret					/* target: see AMD docs */
 
-#else	/* DIAGNOSTIC */
+#else	/* !DIAGNOSTIC */
 
 	movq	CPUVAR(SELF), %rsi
 	movb	$0x00, MTX_LOCK(%rdi)
 	movl	CPU_INFO_MTX_OLDSPL(%rsi), %ecx
 	incl	CPU_INFO_MTX_COUNT(%rsi)
-	movl	CPU_INFO_ILEVEL(%rsi),%edx
+	movzbl	CPU_INFO_ILEVEL(%rsi),%edx
 	cmovnzl	%edx,%ecx
-	pushq	%rbx
 	cmpl	%edx,%ecx			/* new level is lower? */
 	jae	2f
 1:
 #if !defined(XENPV)
-	movl	CPU_INFO_IPENDING(%rsi),%eax
-	testl	%eax,CPU_INFO_IUNMASK(%rsi,%rcx,4)/* deferred interrupts? */
+	movq	CPU_INFO_ISTATE(%rsi),%rax
+	movq	%rax,%r8
+	shrq	$CPU_INFO_IPENDING_SHIFT,%r8
+	testq	%r8,CPU_INFO_IUNMASK(%rsi,%rcx,8)/* deferred interrupts? */
 	jnz	3f
-	movl	%eax,%ebx
-	cmpxchg8b CPU_INFO_ISTATE(%rsi)		/* swap in new ilevel */
+	shlq	$CPU_INFO_IPENDING_SHIFT,%r8
+	orq	%rcx,%r8
+	cmpxchgq %r8,CPU_INFO_ISTATE(%rsi)	/* swap in new ilevel */
 	jnz	4f
 #endif
 #if defined(XEN)
 	movl	CPU_INFO_XPENDING(%rsi),%eax
 	testl	%eax,CPU_INFO_XUNMASK(%rsi,%rcx,4)/* deferred interrupts? */
 	jnz	3f
-	movl	%edx, %eax
-	cmpxchgl %ecx, CPU_INFO_ILEVEL(%rsi)
+	movl	%edx,%eax
+	cmpxchgb %cl,CPU_INFO_ILEVEL(%rsi)
 	jnz	4f
 #endif
 2:
-	popq	%rbx
 	ret
 3:
-	popq	%rbx
 	movl	%ecx, %edi
 	jmp	_C_LABEL(Xspllower)
 4:

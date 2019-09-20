@@ -145,9 +145,6 @@ struct intrhand {
 	struct cpu_info *ih_cpu;
 };
 
-#define IMASK(ci,level) (ci)->ci_imask[(level)]
-#define IUNMASK(ci,level) (ci)->ci_iunmask[(level)]
-
 #ifdef _KERNEL
 
 void Xspllower(int);

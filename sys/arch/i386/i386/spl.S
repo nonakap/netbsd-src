@@ -49,10 +49,10 @@ __KERNEL_RCSID(0, "$NetBSD: spl.S,v 1.47 2019/02/11 14:59:32 cherry Exp $");
  */
 ENTRY(splraise)
 	movl	4(%esp),%edx
-	movl	CPUVAR(ILEVEL),%eax
+	movzbl	CPUVAR(ILEVEL),%eax
 	cmpl	%edx,%eax
 	ja	1f
-	movl	%edx,CPUVAR(ILEVEL)
+	movb	%dl,CPUVAR(ILEVEL)
 1:
 #ifdef SPLDEBUG
 	pushl	%ebp
@@ -87,14 +87,19 @@ ENTRY(spllower)
 	popl	%ebp
 #endif /* SPLDEBUG */
 	movl	4(%esp),%ecx
-	cmpl	CPUVAR(ILEVEL),%ecx
+	cmpb	CPUVAR(ILEVEL),%cl
 	jae	1f
-	movl	CPUVAR(IUNMASK)(,%ecx,4),%edx
+	movl	CPUVAR(IUNMASK)(,%ecx,8),%edx
+	movl	CPUVAR(IUNMASK + 4)(,%ecx,8),%eax
+	shldl	$CPU_INFO_IPENDING_SHIFT,%edx,%eax
+	shll	$CPU_INFO_IPENDING_SHIFT,%edx
 	pushf
 	cli
-	testl	CPUVAR(IPENDING),%edx
+	testl	CPUVAR(ISTATE),%edx
 	jnz	2f
-	movl	%ecx,CPUVAR(ILEVEL)
+	testl	CPUVAR(ISTATE + 4),%eax
+	jnz	2f
+	movb	%cl,CPUVAR(ILEVEL)
 	popf
 1:
 	ret
@@ -115,26 +120,41 @@ END(spllower)
  *
  * For cmpxchg8b, edx/ecx are the high words and eax/ebx the low.
  *
- * edx : eax = old level / old ipending
- * ecx : ebx = new level / old ipending
+ * edx : eax = high 32 bit old ipending / low 24 bit old ipending + old level
+ * ecx : ebx = high 32 bit old ipending / low 24 bit old ipending + new level
  */
 ENTRY(cx8_spllower)
 	movl	4(%esp),%ecx
-	movl	CPUVAR(ILEVEL),%edx
+	movzbl	CPUVAR(ILEVEL),%edx
 	cmpl	%edx,%ecx			/* new level is lower? */
-	pushl	%ebx
 	jae	1f
+	pushl	%ebx
+	pushl	%edi
+	movl	%ecx,%edi
 0:
-	movl	CPUVAR(IPENDING),%eax
-	testl	%eax,CPUVAR(IUNMASK)(,%ecx,4)	/* deferred interrupts? */
+	movl	CPUVAR(ISTATE),%eax
+	movl	CPUVAR(ISTATE + 4),%edx
 	movl	%eax,%ebx
+	shrdl	$CPU_INFO_IPENDING_SHIFT,%edx,%ebx
+	testl	%ebx,CPUVAR(IUNMASK)(,%edi,8)	/* deferred interrupts? */
 	jnz	2f
+	movl	%edx,%ebx
+	shrl	$CPU_INFO_IPENDING_SHIFT,%ebx
+	testl	%ebx,CPUVAR(IUNMASK + 4)(,%edi,8)
+	jnz	2f
+	movl	%eax,%ebx
+	shrl	$CPU_INFO_IPENDING_SHIFT,%ebx
+	shll	$CPU_INFO_IPENDING_SHIFT,%ebx
+	orl	%edi,%ebx
+	movl	%edx,%ecx
 	cmpxchg8b CPUVAR(ISTATE)		/* swap in new ilevel */
 	jnz	0b
-1:
+	popl	%edi
 	popl	%ebx
+1:
 	ret
 2:
+	popl	%edi
 	popl	%ebx
 
 	.type	_C_LABEL(cx8_spllower_patch), @function
@@ -203,11 +223,25 @@ IDTVEC(spllower)
 #endif /* defined(DEBUG) */
 #if !defined(XENPV)
 	movl	%ebx,%eax			/* get cpl */
-	movl	CPUVAR(IUNMASK)(,%eax,4),%eax
-	andl	CPUVAR(IPENDING),%eax		/* any non-masked bits left? */
+	movl	CPUVAR(IUNMASK + 4)(,%eax,8),%eax
+	shll	$CPU_INFO_IPENDING_SHIFT,%eax
+	movb	CPUVAR(IUNMASK + 3)(,%eax,8),%al
+	andl	CPUVAR(ISTATE + 4),%eax		/* any non-masked bits left? */
+	jz	.Lipending_lowbits
+	bsrl	%eax,%eax
+	btrl	%eax,CPUVAR(ISTATE + 4)
+	addl	$(32 - CPU_INFO_IPENDING_SHIFT),%eax
+	movl	CPUVAR(ISOURCES)(,%eax,4),%eax
+	jmp	*IS_RECURSE(%eax)
+.Lipending_lowbits:
+	movl	%ebx,%eax			/* get cpl */
+	movl	CPUVAR(IUNMASK)(,%eax,8),%eax
+	shll	$CPU_INFO_IPENDING_SHIFT,%eax
+	andl	CPUVAR(ISTATE),%eax		/* any non-masked bits left? */
 	jz	2f
 	bsrl	%eax,%eax
-	btrl	%eax,CPUVAR(IPENDING)
+	btrl	%eax,CPUVAR(ISTATE)
+	subl	$CPU_INFO_IPENDING_SHIFT,%eax
 	movl	CPUVAR(ISOURCES)(,%eax,4),%eax
 	jmp	*IS_RECURSE(%eax)
 #endif
@@ -223,7 +257,7 @@ IDTVEC(spllower)
 	jmp	*IS_RECURSE(%eax)
 #endif
 3:
-	movl	%ebx,CPUVAR(ILEVEL)
+	movb	%bl,CPUVAR(ILEVEL)
 #ifdef XEN
 	STIC(%eax)
 	jz 4f
@@ -280,11 +314,20 @@ IDTVEC(doreti)
 #endif /* defined(DEBUG) */
 #if !defined(XENPV)
 	movl	%ebx,%eax
-	movl	CPUVAR(IUNMASK)(,%eax,4),%eax
-	andl	CPUVAR(IPENDING),%eax
+	movl	CPUVAR(IUNMASK)(,%eax,8),%edx
+	movl	CPUVAR(IUNMASK + 4)(,%eax,8),%eax
+	shldl	$CPU_INFO_IPENDING_SHIFT,%edx,%eax
+	shll	$CPU_INFO_IPENDING_SHIFT,%edx
+	andl	CPUVAR(ISTATE + 4),%eax
+	jz	10f
+	bsrl	%eax,%eax
+	addl	$32,%eax
+	jmp	11f
+10:	andl	CPUVAR(ISTATE),%edx
 	jz	2f
-	bsrl	%eax,%eax		/* slow, but not worth optimizing */
-	btrl	%eax,CPUVAR(IPENDING)
+	bsrl	%edx,%eax		/* slow, but not worth optimizing */
+11:	btrl	%eax,CPUVAR(ISTATE)
+	subl	$CPU_INFO_IPENDING_SHIFT,%eax
 	movl	CPUVAR(ISOURCES)(,%eax, 4),%eax
 	jmp	*IS_RESUME(%eax)
 #endif
@@ -300,7 +343,7 @@ IDTVEC(doreti)
 	jmp	*IS_RESUME(%eax)
 #endif
 3:
-	movl	%ebx,CPUVAR(ILEVEL)
+	movb	%bl,CPUVAR(ILEVEL)
 5:
 	testb	$CHK_UPL,TF_CS(%esp)
 	jnz	doreti_checkast
@@ -365,7 +408,7 @@ IDTVEC(softintr)
 	pushl	%ebx
 	pushl	%esi
 	pushl	%edi
-	movl	$IPL_HIGH,CPUVAR(ILEVEL)
+	movb	$IPL_HIGH,CPUVAR(ILEVEL)
 	movl	CPUVAR(CURLWP),%esi
 	movl	IS_LWP(%eax),%edi	/* switch to handler LWP */
 	movl	%edi,CPUVAR(CURLWP)
@@ -411,7 +454,14 @@ END(softintr_ret)
  */
 ENTRY(softint_trigger)
 	movl	4(%esp),%eax
-	orl	%eax,CPUVAR(IPENDING)	/* atomic on local cpu */
+	xorl	%edx,%edx
+	shldl	$CPU_INFO_IPENDING_SHIFT,%eax,%edx
+	shll	$CPU_INFO_IPENDING_SHIFT,%eax
+	pushf
+	cli
+	orl	%eax,CPUVAR(ISTATE)
+	orl	%edx,CPUVAR(ISTATE + 4)
+	popf
 	ret
 END(softint_trigger)
 
@@ -421,7 +471,7 @@ END(softint_trigger)
  * Handles preemption interrupts via Xspllower().
  */
 IDTVEC(recurse_preempt)
-	movl	$IPL_PREEMPT,CPUVAR(ILEVEL)
+	movb	$IPL_PREEMPT,CPUVAR(ILEVEL)
 	sti
 	pushl	$0
 	call	_C_LABEL(kpreempt)
@@ -436,7 +486,7 @@ IDTVEC_END(recurse_preempt)
  * Handles preemption interrupts via Xdoreti().
  */
 IDTVEC(resume_preempt)
-	movl	$IPL_PREEMPT,CPUVAR(ILEVEL)
+	movb	$IPL_PREEMPT,CPUVAR(ILEVEL)
 	sti
 	testb	$CHK_UPL,TF_CS(%esp)
 	jnz	1f

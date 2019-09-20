@@ -152,16 +152,18 @@ struct cpu_info {
 	volatile int	ci_mtx_oldspl;	/* Old SPL at this ci_idepth */
 
 	/* The following must be aligned for cmpxchg8b. */
-	struct {
-		uint32_t	ipending;
-		int		ilevel;
-	} ci_istate __aligned(8);
-#define ci_ipending	ci_istate.ipending
-#define	ci_ilevel	ci_istate.ilevel
+	union {
+		uint64_t		ci_istate;
+		struct {
+#define ILEVEL_NBITS	8
+			uint64_t	ci_ilevel:ILEVEL_NBITS;
+			uint64_t	ci_ipending:(64 - ILEVEL_NBITS);
+		};
+	} __aligned(8);
 	int		ci_idepth;
 	void *		ci_intrstack;
-	uint32_t	ci_imask[NIPL];
-	uint32_t	ci_iunmask[NIPL];
+	uint64_t	ci_imask[NIPL];
+	uint64_t	ci_iunmask[NIPL];
 
 	uint32_t ci_flags;		/* flags; see below */
 	uint32_t ci_ipis;		/* interprocessor interrupts pending */

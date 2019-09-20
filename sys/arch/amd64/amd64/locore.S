@@ -1178,7 +1178,7 @@ ENTRY(cpu_switchto)
 	 * IPL_SCHED prevents from FPU interrupt altering the LWP's saved cr0.
 	 */
 #ifndef XENPV
-	movl	$IPL_HIGH,CPUVAR(ILEVEL)
+	movb	$IPL_HIGH,CPUVAR(ILEVEL)
 	movl	PCB_CR0(%r14),%ecx	/* has CR0_TS clear */
 	movq	%cr0,%rdx
 
@@ -1304,7 +1304,7 @@ ENTRY(handle_syscall)
 	jnz	9f
 
 #ifdef DIAGNOSTIC
-	cmpl	$IPL_NONE,CPUVAR(ILEVEL)
+	cmpb	$IPL_NONE,CPUVAR(ILEVEL)
 	jne	.Lspl_error
 #endif
 
@@ -1324,7 +1324,7 @@ ENTRY(handle_syscall)
 #ifdef DIAGNOSTIC
 .Lspl_error:
 	movabsq	$4f,%rdi
-	movl	CPUVAR(ILEVEL),%esi
+	movzbl	CPUVAR(ILEVEL),%esi
 	call	_C_LABEL(panic)
 4:	.asciz	"spl not lowered on syscall, ilevel=%x"
 #endif

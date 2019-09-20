@@ -215,7 +215,7 @@ IDTVEC(trap07)
 	pushl	$T_DNA
 	INTRENTRY
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	pushl	%esp
 	call	_C_LABEL(fpudna)
@@ -280,7 +280,7 @@ IDTVEC(trap0f)
 	INTRENTRY
 	STI(%eax)
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	jmp	_C_LABEL(trapreturn)
 IDTVEC_END(trap0f)
@@ -296,7 +296,7 @@ IDTVEC(trap10)
 	pushl	$T_ARITHTRAP
 .Ldo_fputrap:
 	INTRENTRY
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 	pushl	%esp
 	addl	$1,CPUVAR(NTRAP)	/* statistical info */
 	adcl	$0,CPUVAR(NTRAP)+4
@@ -403,7 +403,7 @@ ENTRY(alltraps)
 	STI(%eax)
 calltrap:
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 #endif
 	addl	$1,CPUVAR(NTRAP)	/* statistical info */
 	adcl	$0,CPUVAR(NTRAP)+4
@@ -438,7 +438,7 @@ _C_LABEL(trapreturn):	.globl	trapreturn
 	jz	6f
 	/* process pending interrupts */
 	CLI(%eax)
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 	movl	$.Lalltraps_resume,%esi /* address to resume loop at */
 .Lalltraps_resume:
 	movl	%ebx,%eax		/* get cpl */
@@ -449,13 +449,13 @@ _C_LABEL(trapreturn):	.globl	trapreturn
 	btrl	%eax,CPUVAR(XPENDING)
 	movl	CPUVAR(XSOURCES)(,%eax,4),%eax
 	jmp	*IS_RESUME(%eax)
-7:	movl	%ebx,CPUVAR(ILEVEL)	/* restore cpl */
+7:	movb	%bl,CPUVAR(ILEVEL)	/* restore cpl */
 	jmp	_C_LABEL(trapreturn)
 #endif /* XEN */
 #ifndef DIAGNOSTIC
 6:	INTRFASTEXIT
 #else
-6:	cmpl	CPUVAR(ILEVEL),%ebx
+6:	cmpb	CPUVAR(ILEVEL),%bl
 	jne	3f
 	INTRFASTEXIT
 3:	STI(%eax)

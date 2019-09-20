@@ -270,12 +270,12 @@ define	CPU_INFO_SIGNATURE	offsetof(struct cpu_info, ci_signature)
 
 define	CPU_INFO_GDT		offsetof(struct cpu_info, ci_gdt)
 if !defined(XENPV)
-define	CPU_INFO_IPENDING	offsetof(struct cpu_info, ci_ipending)
+define	CPU_INFO_IPENDING_SHIFT	ILEVEL_NBITS
 define	CPU_INFO_IMASK		offsetof(struct cpu_info, ci_imask)
 define	CPU_INFO_ISOURCES	offsetof(struct cpu_info, ci_isources)
 define	CPU_INFO_IUNMASK	offsetof(struct cpu_info, ci_iunmask)
 endif
-define	CPU_INFO_ILEVEL		offsetof(struct cpu_info, ci_ilevel)
+define	CPU_INFO_ILEVEL		offsetof(struct cpu_info, ci_istate)
 define	CPU_INFO_IDEPTH		offsetof(struct cpu_info, ci_idepth)
 define	CPU_INFO_MTX_COUNT	offsetof(struct cpu_info, ci_mtx_count)
 define	CPU_INFO_MTX_OLDSPL	offsetof(struct cpu_info, ci_mtx_oldspl)

@@ -1081,9 +1081,10 @@ ENTRY(cpu_switchto)
 	pushl	%edi
 
 #if defined(DIAGNOSTIC) && !defined(XENPV)
-	cmpl	$IPL_SCHED,CPUVAR(ILEVEL)
+	movzbl	CPUVAR(ILEVEL),%eax
+	cmpl	$IPL_SCHED,%eax
 	jbe	0f
-	pushl	CPUVAR(ILEVEL)
+	pushl	%eax
 	pushl	$.Lstr
 	call	_C_LABEL(panic)
 	addl	$8,%esp
@@ -1200,7 +1201,7 @@ no_RAS:
 	call	_C_LABEL(i386_tls_switch)
 	addl	$4,%esp
 #else
-	movl	$IPL_HIGH,CPUVAR(ILEVEL)
+	movb	$IPL_HIGH,CPUVAR(ILEVEL)
 	movl	PCB_CR0(%ebx),%ecx		/* has CR0_TS clear */
 	movl	%cr0,%edx
 
@@ -1268,7 +1269,7 @@ IDTVEC(syscall)
 	INTRENTRY
 	STI(%eax)
 #ifdef DIAGNOSTIC
-	movl	CPUVAR(ILEVEL),%ebx
+	movzbl	CPUVAR(ILEVEL),%ebx
 	testl	%ebx,%ebx
 	jz	1f
 	pushl	$5f
@@ -1301,7 +1302,7 @@ IDTVEC(syscall)
 	jz	14f
 	/* process pending interrupts */
 	CLI(%eax)
-	movl	CPUVAR(ILEVEL), %ebx
+	movzbl	CPUVAR(ILEVEL), %ebx
 	movl	$.Lsyscall_resume, %esi /* address to resume loop at */
 .Lsyscall_resume:
 	movl	%ebx,%eax		/* get cpl */
@@ -1312,14 +1313,14 @@ IDTVEC(syscall)
 	btrl	%eax,CPUVAR(XPENDING)
 	movl	CPUVAR(XSOURCES)(,%eax,4),%eax
 	jmp	*IS_RESUME(%eax)
-17:	movl	%ebx, CPUVAR(ILEVEL)	/* restore cpl  */
+17:	movb	%bl, CPUVAR(ILEVEL)	/* restore cpl  */
 	jmp	.Lsyscall_checkast
 14:
 #endif /* XEN */
 #ifndef DIAGNOSTIC
 	INTRFASTEXIT
 #else /* DIAGNOSTIC */
-	cmpl	$IPL_NONE,CPUVAR(ILEVEL)
+	cmpb	$IPL_NONE,CPUVAR(ILEVEL)
 	jne	3f
 	INTRFASTEXIT
 3:	STI(%eax)

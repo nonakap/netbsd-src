@@ -263,12 +263,17 @@ ENTRY(mutex_spin_exit)
 	incl	CPUVAR(MTX_COUNT)
 	movb	$0, MTX_LOCK(%edx)		/* zero */
 	jnz	1f
-	movl	%fs:CPU_INFO_IUNMASK(,%ecx,4), %edx
+	movl	CPUVAR(IUNMASK)(,%ecx,8), %edx
+	movl	CPUVAR(IUNMASK + 4)(,%ecx,8), %eax
+	shldl	$CPU_INFO_IPENDING_SHIFT, %edx, %eax
+	shll	$CPU_INFO_IPENDING_SHIFT, %edx
 	cli
-	testl	CPUVAR(IPENDING), %edx
+	testl	CPUVAR(ISTATE), %edx
 	movl    %ecx, 4(%esp)
 	jnz	_C_LABEL(Xspllower)		/* does sti */
-	movl	%ecx, CPUVAR(ILEVEL)
+	testl	CPUVAR(ISTATE + 4), %eax
+	jnz	_C_LABEL(Xspllower)		/* does sti */
+	movb	%cl, CPUVAR(ILEVEL)
 	sti
 1:	ret
 	.space 32
@@ -284,20 +289,36 @@ ENTRY(i686_mutex_spin_exit)
 	mov	4(%esp),%edx
 	movl	CPUVAR(MTX_OLDSPL), %ecx
 	incl	CPUVAR(MTX_COUNT)
-	movb	%ch, MTX_LOCK(%edx)		/* zero */
+	movb	$0, MTX_LOCK(%edx)		/* zero */
 	jnz	1f
 	pushl	%ebx
+	pushl	%edi
+	movl	%ecx,%edi
 0:
-	movl	CPUVAR(IPENDING), %eax
-	testl	%eax, %fs:CPU_INFO_IUNMASK(,%ecx,4)
+	movl	CPUVAR(ISTATE), %eax
+	movl	CPUVAR(ISTATE + 4), %edx
+	movl	%eax, %ebx
+	shrdl	$CPU_INFO_IPENDING_SHIFT, %edx, %ebx
+	testl	%ebx, CPUVAR(IUNMASK)(,%edi,8)
+	jnz	2f
+	movl	%edx, %ebx
+	shrl	$CPU_INFO_IPENDING_SHIFT, %ebx
+	testl	%ebx, CPUVAR(IUNMASK + 4)(,%edi,8)
 	jnz	2f
 	movl	%eax, %ebx
+	shrl	$CPU_INFO_IPENDING_SHIFT, %ebx
+	shll	$CPU_INFO_IPENDING_SHIFT, %ebx
+	orl	%edi, %ebx
+	movl	%edx, %ecx
 	cmpxchg8b CPUVAR(ISTATE)		/* swap in new ilevel */
 	jnz	0b
+	popl	%edi
 	popl	%ebx
 1:
 	ret
 2:
+	movl	%edi,%ecx
+	popl	%edi
 	popl	%ebx
 	movl	%ecx,4(%esp)
 LABEL(i686_mutex_spin_exit_patch)
