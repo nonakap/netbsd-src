@@ -42,3 +42,13 @@ struct devdesc {
 	char	d_name[MAXDEVNAME];
 	char	d_unit;
 };
+
+struct netboot_fstab {
+	const char *name;
+	struct fs_ops *ops;
+};
+
+extern const struct netboot_fstab netboot_fstab[];
+extern const int nnetboot_fstab;
+
+const struct netboot_fstab *netboot_fstab_find(const char *);
