@@ -622,6 +622,10 @@ adma_done:
 		saa.saa_caps |= SMC_CAPS_SINGLE_ONLY;
 	if (ISSET(sc->sc_flags, SDHC_FLAG_POLL_CARD_DET))
 		saa.saa_caps |= SMC_CAPS_POLL_CARD_DET;
+	if (ISSET(sc->sc_flags, SDHC_FLAG_MMC_WAIT_WHILE_BUSY))
+		saa.saa_caps |= SMC_CAPS_MMC_WAIT_WHILE_BUSY;
+	if (ISSET(sc->sc_flags, SDHC_FLAG_MMC_DDR52))
+		saa.saa_caps |= SMC_CAPS_MMC_DDR52;
 
 	if (ISSET(sc->sc_flags, SDHC_FLAG_BROKEN_ADMA2_ZEROLEN))
 		saa.saa_max_seg = 65535;
@@ -964,6 +968,13 @@ sdhc_bus_power(sdmmc_chipset_handle_t sch, uint32_t ocr)
 			error = ENXIO;
 			goto out;
 		}
+
+		if (ISSET(hp->sc->sc_flags, SDHC_FLAG_POWERUP_RESET)) {
+			HSET1(hp, SDHC_POWER_CTL, SDHC_HW_RESET);
+			sdmmc_delay(10);
+			HCLR1(hp, SDHC_POWER_CTL, SDHC_HW_RESET);
+			sdmmc_delay(300);
+		}
 	}
 
 out:
@@ -1132,6 +1143,37 @@ sdhc_bus_clock_ddr(sdmmc_chipset_handle_t sch, int freq, bool ddr)
 		} else if (freq > 400) {
 			HSET2(hp, SDHC_HOST_CTL2, SDHC_UHS_MODE_SELECT_SDR12);
 		}
+
+		/*
+		 * AMDI0040 controllers require SDHCI_CTRL2_SAMPLING_CLOCK
+		 * to be disabled when switching from HS200 to high speed and
+		 * to always be turned on again when tuning for HS400.
+		 * In the later case, an AMD-specific DLL reset additionally
+		 * is needed.
+		 */
+#if 0	/* XXX FIXME */
+		if (strcmp(acpi_dev->hid, "AMDI0040") == 0 && acpi_dev->uid == 0) {
+			ios = &slot->host.ios;
+			timing = ios->timing;
+			if (old_timing == SDHCI_CTRL2_UHS_SDR104 &&
+			    timing == bus_timing_hs)
+				SDHCI_WRITE_2(bus, slot, SDHCI_HOST_CONTROL2,
+				    SDHCI_READ_2(bus, slot, SDHCI_HOST_CONTROL2) &
+				    ~SDHCI_CTRL2_SAMPLING_CLOCK);
+			if (ios->clock > SD_SDR50_MAX &&
+			    old_timing != SDHCI_CTRL2_MMC_HS400 &&
+			    timing == bus_timing_mmc_hs400) {
+				SDHCI_WRITE_2(bus, slot, SDHCI_HOST_CONTROL2,
+				    SDHCI_READ_2(bus, slot, SDHCI_HOST_CONTROL2) |
+				    SDHCI_CTRL2_SAMPLING_CLOCK);
+				SDHCI_WRITE_4(bus, slot, SDHCI_AMD_RESET_DLL_REG,
+				    0x40003210);
+				DELAY(20);
+				SDHCI_WRITE_4(bus, slot, SDHCI_AMD_RESET_DLL_REG,
+				    0x40033210);
+			}
+		}
+#endif
 	}
 
 	/*

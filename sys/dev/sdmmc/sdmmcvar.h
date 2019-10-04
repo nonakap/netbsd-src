@@ -254,6 +254,7 @@ struct sdmmc_softc {
 				    | SMC_CAPS_UHS_SDR104 \
 				    | SMC_CAPS_UHS_DDR50)
 #define SMC_CAPS_MMC_HS200	__BIT(15)	/* eMMC HS200 timing */
+#define SMC_CAPS_MMC_WAIT_WHILE_BUSY __BIT(16)
 #define SMC_CAPS_POLLING	__BIT(30)	/* driver supports cmd polling */
 
 	/* function */

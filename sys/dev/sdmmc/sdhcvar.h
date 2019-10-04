@@ -67,6 +67,9 @@ struct sdhc_softc {
 						   * Can't 64K Byte data transfer
 						   */
 #define	SDHC_FLAG_NO_1_8_V	0x10000000 /* No 1.8V supply */
+#define	SDHC_FLAG_POWERUP_RESET	0x20000000 /* H/W reset after power up */
+#define	SDHC_FLAG_MMC_WAIT_WHILE_BUSY 0x40000000
+#define	SDHC_FLAG_MMC_DDR52	0x80000000 /* MMC HS DDR52 support */
 
 	uint32_t		sc_clkbase;
 	int			sc_clkmsk;	/* Mask for SDCLK */

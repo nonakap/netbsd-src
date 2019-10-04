@@ -92,6 +92,7 @@
 #define  SDHC_4BIT_MODE			(1<<1)
 #define  SDHC_LED_ON			(1<<0)
 #define SDHC_POWER_CTL			0x29
+#define  SDHC_HW_RESET			(1<<4)	/* Intel */
 #define  SDHC_VOLTAGE_SHIFT		1
 #define  SDHC_VOLTAGE_MASK		0x07
 #define   SDHC_VOLTAGE_3_3V		0x07
@@ -205,6 +206,7 @@
 #define  SDHC_RETUNING_MODE_3		(2 << SDHC_RETUNING_MODES_SHIFT)
 #define  SDHC_CLOCK_MULTIPLIER_SHIFT	16
 #define  SDHC_CLOCK_MULTIPLIER_MASK	0xff
+#define  SDHC_CAN_MMC_HS400		(1u<<31) /* Intel */
 #define SDHC_ADMA_ERROR_STATUS		0x54
 #define  SDHC_ADMA_LENGTH_MISMATCH	(1<<2)
 #define  SDHC_ADMA_ERROR_STATE		(3<<0)

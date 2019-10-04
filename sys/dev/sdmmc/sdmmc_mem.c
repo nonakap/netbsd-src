@@ -1645,7 +1645,15 @@ sdmmc_mem_mmc_switch(struct sdmmc_function *sf, uint8_t set, uint8_t index,
 	cmd.c_opcode = MMC_SWITCH;
 	cmd.c_arg = (MMC_SWITCH_MODE_WRITE_BYTE << 24) |
 	    (index << 16) | (value << 8) | set;
-	cmd.c_flags = SCF_RSP_SPI_R1B | SCF_RSP_R1B | SCF_CMD_AC;
+        /*
+	 * If the hardware supports busy detection but the switch timeout
+	 * exceeds the maximum host timeout, use a R1 instead of a R1B
+	 * response in order to keep the hardware from timing out.
+	 */
+	if (ISSET(sc->sc_flags, SMC_CAPS_MMC_WAIT_WHILE_BUSY)) /*XXX timeout*/
+		cmd.c_flags = SCF_RSP_SPI_R1 | SCF_RSP_R1 | SCF_CMD_AC;
+	else
+		cmd.c_flags = SCF_RSP_SPI_R1B | SCF_RSP_R1B | SCF_CMD_AC;
 
 	if (poll)
 		cmd.c_flags |= SCF_POLL;

@@ -44,6 +44,40 @@ __KERNEL_RCSID(0, "$NetBSD: sdhc_acpi.c,v 1.8 2019/10/15 00:13:52 chs Exp $");
 #define _COMPONENT	ACPI_RESOURCE_COMPONENT
 ACPI_MODULE_NAME	("sdhc_acpi")
 
+static const struct sdhc_acpi_device {
+	const char	*hid;
+	const char	*uid;
+	const char	*desc;
+	u_int		quirks;
+} sdhc_acpi_devices[] = {
+	{ "80860F14",	"1",
+	    "Intel Bay Trail/Braswell eMMC 4.5/4.5.1 Controller",
+	    SDHC_FLAG_USE_DMA |
+	    SDHC_FLAG_POWERUP_RESET |
+	    SDHC_FLAG_MMC_WAIT_WHILE_BUSY },
+	{ "80860F14",	"3",
+	    "Intel Bay Trail/Braswell SDXC Controller",
+	    SDHC_FLAG_USE_DMA |
+	    SDHC_FLAG_MMC_WAIT_WHILE_BUSY },
+	{ "80860F16",	NULL,
+	    "Intel Bay Trail/Braswell SDXC Controller",
+	    SDHC_FLAG_USE_DMA |
+	    SDHC_FLAG_MMC_WAIT_WHILE_BUSY },
+	{ "80865ACA",	NULL,
+	    "Intel Apollo Lake SDXC Controller",
+	    // SDHC_FLAG_USE_DMA |	/* APL18 erratum */
+	    SDHC_FLAG_MMC_WAIT_WHILE_BUSY },
+	{ "80865ACC",	NULL,
+	    "Intel Apollo Lake eMMC 5.0 Controller",
+	    // SDHC_FLAG_USE_DMA |	/* APL18 erratum */
+	    SDHC_FLAG_POWERUP_RESET |
+	    SDHC_FLAG_MMC_WAIT_WHILE_BUSY |
+	    SDHC_FLAG_MMC_DDR52 },
+	{ "AMDI0040",	NULL,
+	    "AMD eMMC 5.0 Controller",
+	    SDHC_FLAG_USE_DMA },
+};
+
 static int	sdhc_acpi_match(device_t, cfdata_t, void *);
 static void	sdhc_acpi_attach(device_t, device_t, void *);
 static int	sdhc_acpi_detach(device_t, int);
@@ -55,6 +89,7 @@ struct sdhc_acpi_softc {
 	bus_space_handle_t sc_memh;
 	bus_size_t sc_memsize;
 	void *sc_ih;
+	const struct sdhc_acpi_device *sc_sadev;
 
 	ACPI_HANDLE sc_crs, sc_srs;
 	ACPI_BUFFER sc_crs_buffer;
@@ -63,35 +98,13 @@ struct sdhc_acpi_softc {
 CFATTACH_DECL_NEW(sdhc_acpi, sizeof(struct sdhc_acpi_softc),
     sdhc_acpi_match, sdhc_acpi_attach, sdhc_acpi_detach, NULL);
 
-static void	sdhc_acpi_intel_emmc_hw_reset(struct sdhc_softc *,
-		    struct sdhc_host *);
+#define HREAD4(sc, reg)	\
+	(bus_space_read_4((sc)->sc_memt, (sc)->sc_memh, (reg)))
 
-static const struct sdhc_acpi_slot {
-	const char *hid;
-	const char *uid;
-	int type;
-#define	SLOT_TYPE_SD	0	/* SD or SDIO */
-#define	SLOT_TYPE_EMMC	1	/* eMMC */
-} sdhc_acpi_slot_map[] = {
-	{ "80865ACA",	NULL,	SLOT_TYPE_SD },
-	{ "80865ACC",	NULL,	SLOT_TYPE_EMMC },
-	{ "80865AD0",	NULL,	SLOT_TYPE_SD },
-	{ "80860F14",   "1",	SLOT_TYPE_EMMC },
-	{ "80860F14",   "3",	SLOT_TYPE_SD },
-	{ "80860F16",   NULL,	SLOT_TYPE_SD },
-	{ "INT33BB",	"2",	SLOT_TYPE_SD },
-	{ "INT33BB",	"3",	SLOT_TYPE_SD },
-	{ "INT33C6",	NULL,	SLOT_TYPE_SD },
-	{ "INT3436",	NULL,	SLOT_TYPE_SD },
-	{ "INT344D",	NULL,	SLOT_TYPE_SD },
-	{ "PNP0D40",	NULL,	SLOT_TYPE_SD },
-	{ "PNP0FFF",	"3",	SLOT_TYPE_SD },
-};
-
-static const struct sdhc_acpi_slot *
-sdhc_acpi_find_slot(ACPI_DEVICE_INFO *ad)
+static const struct sdhc_acpi_device *
+sdhc_acpi_find_device(ACPI_DEVICE_INFO *ad)
 {
-	const struct sdhc_acpi_slot *slot;
+	const struct sdhc_acpi_device *dev;
 	const char *hid, *uid;
 	size_t i;
 
@@ -101,15 +114,17 @@ sdhc_acpi_find_slot(ACPI_DEVICE_INFO *ad)
 	if (!(ad->Valid & ACPI_VALID_HID) || hid == NULL)
 		return NULL;
 
-	for (i = 0; i < __arraycount(sdhc_acpi_slot_map); i++) {
-		slot = &sdhc_acpi_slot_map[i];
-		if (strcmp(hid, slot->hid) == 0) {
-			if (slot->uid == NULL ||
-			    ((ad->Valid & ACPI_VALID_UID) != 0 &&
-			     uid != NULL &&
-			     strcmp(uid, slot->uid) == 0))
-				return slot;
-		}
+	if (!(ad->Valid & ACPI_VALID_UID))
+		uid = NULL;
+
+	for (i = 0; i < __arraycount(sdhc_acpi_devices); i++) {
+		dev = &sdhc_acpi_devices[i];
+		if (strcmp(hid, dev->hid))
+			continue;
+
+		if (dev->uid == NULL ||
+		    (uid != NULL && strcmp(uid, dev->uid) == 0))
+			return dev;
 	}
 	return NULL;
 }
@@ -122,7 +137,7 @@ sdhc_acpi_match(device_t parent, cfdata_t match, void *opaque)
 	if (aa->aa_node->ad_type != ACPI_TYPE_DEVICE)
 		return 0;
 
-	return sdhc_acpi_find_slot(aa->aa_node->ad_devinfo) != NULL;
+	return sdhc_acpi_find_device(aa->aa_node->ad_devinfo) != NULL;
 }
 
 static void
@@ -130,7 +145,6 @@ sdhc_acpi_attach(device_t parent, device_t self, void *opaque)
 {
 	struct sdhc_acpi_softc *sc = device_private(self);
 	struct acpi_attach_args *aa = opaque;
-	const struct sdhc_acpi_slot *slot;
 	struct acpi_resources res;
 	struct acpi_mem *mem;
 	struct acpi_irq *irq;
@@ -141,9 +155,8 @@ sdhc_acpi_attach(device_t parent, device_t self, void *opaque)
 	sc->sc.sc_host = NULL;
 	sc->sc_memt = aa->aa_memt;
 
-	slot = sdhc_acpi_find_slot(aa->aa_node->ad_devinfo);
-	if (slot->type == SLOT_TYPE_EMMC)
-		sc->sc.sc_vendor_hw_reset = sdhc_acpi_intel_emmc_hw_reset;
+	sc->sc_sadev = sdhc_acpi_find_device(aa->aa_node->ad_devinfo);
+	sc->sc.sc_flags = sc->sc_sadev->quirks;
 
 	rv = acpi_resource_parse(self, aa->aa_node->ad_handle, "_CRS",
 	    &res, &acpi_resource_parse_ops_default);
@@ -188,11 +201,25 @@ sdhc_acpi_attach(device_t parent, device_t self, void *opaque)
 		goto unmap;
 	}
 
+	/*
+	 * Intel Bay Trail and Braswell eMMC controllers share the same IDs,
+	 * but while with these former DDR52 is affected by the VLI54 erratum,
+	 * these latter require the timeout clock to be hardcoded to 1 MHz.
+	 */
+	if (strcmp(sc->sc_sadev->hid, "80860F14") == 0 &&
+	    strcmp(sc->sc_sadev->uid, "1") == 0 &&
+	    HREAD4(sc, SDHC_CAPABILITIES) == 0x446cc8b2 &&
+	    HREAD4(sc, SDHC_CAPABILITIES2) == 0x00000807) {
+		sc->sc.sc_flags |= SDHC_FLAG_MMC_DDR52;
+#if 0	/* XXX timeout */
+		sc->sc.sc_flags |= SDHC_FLAG_DATA_TIMEOUT_1MHZ;
+#endif
+	}
+
+	if (ISSET(sc->sc.sc_flags, SDHC_FLAG_USE_DMA))
+		SET(sc->sc.sc_flags, SDHC_FLAG_USE_ADMA2);
+
 	sc->sc.sc_host = kmem_zalloc(sizeof(struct sdhc_host *), KM_SLEEP);
-
-	/* Enable DMA transfer */
-	sc->sc.sc_flags |= SDHC_FLAG_USE_DMA;
-
 	if (sdhc_host_found(&sc->sc, sc->sc_memt, sc->sc_memh,
 	    sc->sc_memsize) != 0) {
 		aprint_error_dev(self, "couldn't initialize host\n");
@@ -265,26 +292,4 @@ sdhc_acpi_resume(device_t self, const pmf_qual_t *qual)
 	}
 
 	return sdhc_resume(self, qual);
-}
-
-static void
-sdhc_acpi_intel_emmc_hw_reset(struct sdhc_softc *sc, struct sdhc_host *hp)
-{
-	kmutex_t *plock = sdhc_host_lock(hp);
-	uint8_t reg;
-
-	mutex_enter(plock);
-
-	reg = sdhc_host_read_1(hp, SDHC_POWER_CTL);
-	reg |= 0x10;
-	sdhc_host_write_1(hp, SDHC_POWER_CTL, reg);
-
-	sdmmc_delay(10);
-
-	reg &= ~0x10;
-	sdhc_host_write_1(hp, SDHC_POWER_CTL, reg);
-
-	sdmmc_delay(1000);
-
-	mutex_exit(plock);
 }

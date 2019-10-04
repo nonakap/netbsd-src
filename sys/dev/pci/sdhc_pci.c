@@ -86,7 +86,10 @@ static const struct sdhc_pci_quirk {
 #define	SDHC_PCI_QUIRK_NO_PWR0			__BIT(2)
 #define	SDHC_PCI_QUIRK_RICOH_LOWER_FREQ_HACK	__BIT(3)
 #define	SDHC_PCI_QUIRK_RICOH_SLOW_SDR50_HACK	__BIT(4)
-#define	SDHC_PCI_QUIRK_INTEL_EMMC_HW_RESET	__BIT(5)
+#define	SDHC_PCI_QUIRK_BROKEN_DMA		__BIT(5)
+#define	SDHC_PCI_QUIRK_POWERUP_RESET		__BIT(6)
+#define	SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY	__BIT(7)
+#define	SDHC_PCI_QUIRK_MMC_DDR52		__BIT(8)
 } sdhc_pci_quirk_table[] = {
 	{
 		PCI_VENDOR_TI,
@@ -146,7 +149,38 @@ static const struct sdhc_pci_quirk {
 		0xffff,
 		0xffff,
 		~0,
-		SDHC_PCI_QUIRK_INTEL_EMMC_HW_RESET
+		SDHC_PCI_QUIRK_POWERUP_RESET |
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY
+	},
+
+	{
+		PCI_VENDOR_INTEL,
+		PCI_PRODUCT_INTEL_BAYTRAIL_SCC_SDIO,
+		0xffff,
+		0xffff,
+		~0,
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY
+	},
+
+	{
+		PCI_VENDOR_INTEL,
+		PCI_PRODUCT_INTEL_BAYTRAIL_SCC_MMC2,
+		0xffff,
+		0xffff,
+		~0,
+		SDHC_PCI_QUIRK_POWERUP_RESET |
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY
+	},
+
+	{
+		PCI_VENDOR_INTEL,
+		PCI_PRODUCT_INTEL_C3K_EMMC,
+		0xffff,
+		0xffff,
+		~0,
+		SDHC_PCI_QUIRK_POWERUP_RESET |
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY |
+		SDHC_PCI_QUIRK_MMC_DDR52
 	},
 
 	{
@@ -155,23 +189,45 @@ static const struct sdhc_pci_quirk {
 		0xffff,
 		0xffff,
 		~0,
-		SDHC_PCI_QUIRK_INTEL_EMMC_HW_RESET
+		SDHC_PCI_QUIRK_POWERUP_RESET |
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY |
+		SDHC_PCI_QUIRK_MMC_DDR52
 	},
 
 	{
 		PCI_VENDOR_INTEL,
-		PCI_PRODUCT_INTEL_100SERIES_LP_EMMC,
+		PCI_PRODUCT_INTEL_BSW_SSC_SD,
 		0xffff,
 		0xffff,
 		~0,
-		SDHC_PCI_QUIRK_INTEL_EMMC_HW_RESET
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY
+	},
+
+	{
+		PCI_VENDOR_INTEL,
+		PCI_PRODUCT_INTEL_APL_SD,
+		0xffff,
+		0xffff,
+		~0,
+		SDHC_PCI_QUIRK_BROKEN_DMA |	/* APL18 erratum */
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY
+	},
+
+	{
+		PCI_VENDOR_INTEL,
+		PCI_PRODUCT_INTEL_APL_EMMC,
+		0xffff,
+		0xffff,
+		~0,
+		SDHC_PCI_QUIRK_BROKEN_DMA |	/* APL18 erratum */
+		SDHC_PCI_QUIRK_POWERUP_RESET |
+		SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY |
+		SDHC_PCI_QUIRK_MMC_DDR52
 	},
 };
 
 static void sdhc_pci_quirk_ti_hack(struct pci_attach_args *);
 static void sdhc_pci_quirk_ricoh_lower_freq_hack(struct pci_attach_args *);
-static void sdhc_pci_intel_emmc_hw_reset(struct sdhc_softc *,
-    struct sdhc_host *);
 
 static uint32_t
 sdhc_pci_lookup_quirk_flags(struct pci_attach_args *pa)
@@ -272,8 +328,12 @@ sdhc_pci_attach(device_t parent, device_t self, void *aux)
 		sdhc_pci_quirk_ricoh_lower_freq_hack(pa);
 	if (ISSET(flags, SDHC_PCI_QUIRK_RICOH_SLOW_SDR50_HACK))
 		SET(sc->sc.sc_flags, SDHC_FLAG_SLOW_SDR50);
-	if (ISSET(flags, SDHC_PCI_QUIRK_INTEL_EMMC_HW_RESET))
-		sc->sc.sc_vendor_hw_reset = sdhc_pci_intel_emmc_hw_reset;
+	if (ISSET(flags, SDHC_PCI_QUIRK_POWERUP_RESET))
+		SET(sc->sc.sc_flags, SDHC_FLAG_POWERUP_RESET);
+	if (ISSET(flags, SDHC_PCI_QUIRK_MMC_WAIT_WHILE_BUSY))
+		SET(sc->sc.sc_flags, SDHC_FLAG_MMC_WAIT_WHILE_BUSY);
+	if (ISSET(flags, SDHC_PCI_QUIRK_MMC_DDR52))
+		SET(sc->sc.sc_flags, SDHC_FLAG_MMC_DDR52);
 
 	/*
 	 * Map and attach all hosts supported by the host controller.
@@ -283,7 +343,7 @@ sdhc_pci_attach(device_t parent, device_t self, void *aux)
 
 	/* Allocate an array big enough to hold all the possible hosts */
 	sc->sc.sc_host = malloc(sizeof(struct sdhc_host *) * nslots,
-	    M_DEVBUF, M_NOWAIT | M_ZERO);
+	    M_DEVBUF, M_WAITOK | M_ZERO);
 	if (sc->sc.sc_host == NULL) {
 		aprint_error_dev(self, "couldn't alloc memory\n");
 		goto err;
@@ -311,7 +371,10 @@ sdhc_pci_attach(device_t parent, device_t self, void *aux)
 
 	/* Enable use of DMA if supported by the interface. */
 	if ((PCI_INTERFACE(pa->pa_class) == SDHC_PCI_INTERFACE_DMA))
-		SET(sc->sc.sc_flags, SDHC_FLAG_USE_DMA);
+		SET(sc->sc.sc_flags, SDHC_FLAG_USE_DMA | SDHC_FLAG_USE_ADMA2);
+
+	if (ISSET(flags, SDHC_PCI_QUIRK_BROKEN_DMA))
+		CLR(sc->sc.sc_flags, SDHC_FLAG_USE_DMA);
 
 	/* XXX: handle 64-bit BARs */
 	cnt = 0;
@@ -441,26 +504,4 @@ sdhc_pci_quirk_ricoh_lower_freq_hack(struct pci_attach_args *pa)
 	sdhc_pci_conf_write(pa, SDHC_PCI_BASE_FREQ_KEY, 0x01);
 	sdhc_pci_conf_write(pa, SDHC_PCI_BASE_FREQ, 50);
 	sdhc_pci_conf_write(pa, SDHC_PCI_BASE_FREQ_KEY, 0x00);
-}
-
-static void
-sdhc_pci_intel_emmc_hw_reset(struct sdhc_softc *sc, struct sdhc_host *hp)
-{
-	kmutex_t *plock = sdhc_host_lock(hp);
-	uint8_t reg;
-
-	mutex_enter(plock);
-
-	reg = sdhc_host_read_1(hp, SDHC_POWER_CTL);
-	reg |= 0x10;
-	sdhc_host_write_1(hp, SDHC_POWER_CTL, reg);
-
-	sdmmc_delay(10);
-
-	reg &= ~0x10;
-	sdhc_host_write_1(hp, SDHC_POWER_CTL, reg);
-
-	sdmmc_delay(1000);
-
-	mutex_exit(plock);
 }
