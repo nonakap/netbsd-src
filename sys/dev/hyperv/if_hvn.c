@@ -49,8 +49,10 @@ __KERNEL_RCSID(0, "$NetBSD: if_hvn.c,v 1.18 2020/05/24 10:31:59 nonaka Exp $");
 #include <sys/device.h>
 #include <sys/atomic.h>
 #include <sys/bus.h>
+#include <sys/condvar.h>
 #include <sys/intr.h>
 #include <sys/kmem.h>
+#include <sys/mutex.h>
 
 #include <net/if.h>
 #include <net/if_ether.h>
@@ -115,13 +117,13 @@ TAILQ_HEAD(rndis_queue, rndis_cmd);
 
 struct hvn_tx_desc {
 	uint32_t			txd_id;
-	int				txd_ready;
 	struct vmbus_gpa		txd_sgl[HVN_TX_FRAGS + 1];
 	int				txd_nsge;
 	struct mbuf			*txd_buf;
 	bus_dmamap_t			txd_dmap;
 	struct vmbus_gpa		txd_gpa;
 	struct rndis_packet_msg		*txd_req;
+	TAILQ_ENTRY(hvn_tx_desc)	txd_entry;
 };
 
 struct hvn_softc {
@@ -167,8 +169,10 @@ struct hvn_softc {
 	struct hyperv_dma		sc_rx_dma;
 
 	/* Tx ring */
-	uint32_t			sc_tx_next;
 	uint32_t			sc_tx_avail;
+	kmutex_t			sc_txd_list_lock;
+	kcondvar_t			sc_txd_list_cv;
+	TAILQ_HEAD(, hvn_tx_desc)	sc_txd_list;
 	struct hvn_tx_desc		sc_tx_desc[HVN_TX_DESC];
 	bus_dmamap_t			sc_tx_rmap;
 	uint8_t				*sc_tx_msgs;
@@ -201,6 +205,10 @@ static int	hvn_rx_ring_create(struct hvn_softc *);
 static int	hvn_rx_ring_destroy(struct hvn_softc *);
 static int	hvn_tx_ring_create(struct hvn_softc *);
 static void	hvn_tx_ring_destroy(struct hvn_softc *);
+static int	hvn_txd_peek(struct hvn_softc *);
+static struct hvn_tx_desc *
+		hvn_txd_get(struct hvn_softc *);
+static void	hvn_txd_put(struct hvn_softc *, struct hvn_tx_desc *);
 static int	hvn_set_capabilities(struct hvn_softc *);
 static int	hvn_get_lladdr(struct hvn_softc *, uint8_t *);
 static void	hvn_get_link_status(struct hvn_softc *);
@@ -493,7 +501,7 @@ hvn_start(struct ifnet *ifp)
 		return;
 
 	for (;;) {
-		if (!sc->sc_tx_avail) {
+		if (!hvn_txd_peek(sc)) {
 			/* transient */
 			ifp->if_flags |= IFF_OACTIVE;
 			break;
@@ -510,8 +518,6 @@ hvn_start(struct ifnet *ifp)
 			continue;
 		}
 
-		bpf_mtap(ifp, m, BPF_D_OUT);
-
 		if (hvn_rndis_output(sc, txd)) {
 			hvn_decap(sc, txd);
 			if_statinc(ifp, if_oerrors);
@@ -519,7 +525,7 @@ hvn_start(struct ifnet *ifp)
 			continue;
 		}
 
-		sc->sc_tx_next++;
+		bpf_mtap(ifp, m, BPF_D_OUT);
 	}
 }
 
@@ -555,12 +561,7 @@ hvn_encap(struct hvn_softc *sc, struct mbuf *m, struct hvn_tx_desc **txd0)
 	size_t pktlen;
 	int i, rv;
 
-	do {
-		txd = &sc->sc_tx_desc[sc->sc_tx_next % HVN_TX_DESC];
-		sc->sc_tx_next++;
-	} while (!txd->txd_ready);
-	txd->txd_ready = 0;
-
+	txd = hvn_txd_get(sc);
 	pkt = txd->txd_req;
 	memset(pkt, 0, HVN_RNDIS_PKT_LEN);
 	pkt->rm_type = REMOTE_NDIS_PACKET_MSG;
@@ -634,8 +635,6 @@ hvn_encap(struct hvn_softc *sc, struct mbuf *m, struct hvn_tx_desc **txd0)
 
 	*txd0 = txd;
 
-	atomic_dec_uint(&sc->sc_tx_avail);
-
 	return 0;
 }
 
@@ -650,8 +649,7 @@ hvn_decap(struct hvn_softc *sc, struct hvn_tx_desc *txd)
 	bus_dmamap_unload(sc->sc_dmat, txd->txd_dmap);
 	txd->txd_buf = NULL;
 	txd->txd_nsge = 0;
-	txd->txd_ready = 1;
-	atomic_inc_uint(&sc->sc_tx_avail);
+	hvn_txd_put(sc, txd);
 	ifp->if_flags &= ~IFF_OACTIVE;
 }
 
@@ -687,9 +685,7 @@ hvn_txeof(struct hvn_softc *sc, uint64_t tid)
 	m_freem(m);
 	if_statinc(ifp, if_opackets);
 
-	txd->txd_ready = 1;
-
-	atomic_inc_uint(&sc->sc_tx_avail);
+	hvn_txd_put(sc, txd);
 	ifp->if_flags &= ~IFF_OACTIVE;
 }
 
@@ -792,6 +788,10 @@ hvn_tx_ring_create(struct hvn_softc *sc)
 	int i, rsegs;
 	paddr_t pa;
 
+	mutex_init(&sc->sc_txd_list_lock, MUTEX_DEFAULT, IPL_NET);
+	cv_init(&sc->sc_txd_list_cv, "hvntxdcv");
+	TAILQ_INIT(&sc->sc_txd_list);
+
 	msgsize = roundup(HVN_RNDIS_PKT_LEN, 128);
 
 	/* Allocate memory to store RNDIS messages */
@@ -837,9 +837,8 @@ hvn_tx_ring_create(struct hvn_softc *sc)
 		txd->txd_gpa.gpa_len = msgsize;
 		txd->txd_req = (void *)(sc->sc_tx_msgs + (msgsize * i));
 		txd->txd_id = i + HVN_NVS_CHIM_SIG;
-		txd->txd_ready = 1;
+		hvn_txd_put(sc, txd);
 	}
-	sc->sc_tx_avail = HVN_TX_DESC;
 
 	return 0;
 
@@ -885,6 +884,44 @@ hvn_tx_ring_destroy(struct hvn_softc *sc)
 		bus_dmamem_free(sc->sc_dmat, &sc->sc_tx_mseg, 1);
 		sc->sc_tx_msgs = NULL;
 	}
+}
+
+static int
+hvn_txd_peek(struct hvn_softc *sc)
+{
+	int avail;
+
+	mutex_enter(&sc->sc_txd_list_lock);
+	avail = sc->sc_tx_avail;
+	mutex_exit(&sc->sc_txd_list_lock);
+
+	return avail;
+}
+
+static struct hvn_tx_desc *
+hvn_txd_get(struct hvn_softc *sc)
+{
+	struct hvn_tx_desc *txd;
+
+	mutex_enter(&sc->sc_txd_list_lock);
+	while ((txd = TAILQ_FIRST(&sc->sc_txd_list)) == NULL)
+		cv_wait(&sc->sc_txd_list_cv, &sc->sc_txd_list_lock);
+	TAILQ_REMOVE(&sc->sc_txd_list, txd, txd_entry);
+	sc->sc_tx_avail--;
+	mutex_exit(&sc->sc_txd_list_lock);
+
+	return txd;
+}
+
+static void
+hvn_txd_put(struct hvn_softc *sc, struct hvn_tx_desc *txd)
+{
+
+	mutex_enter(&sc->sc_txd_list_lock);
+	TAILQ_INSERT_TAIL(&sc->sc_txd_list, txd, txd_entry);
+	sc->sc_tx_avail++;
+	cv_signal(&sc->sc_txd_list_cv);
+	mutex_exit(&sc->sc_txd_list_lock);
 }
 
 static int
