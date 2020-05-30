@@ -126,11 +126,35 @@ struct hvn_tx_desc {
 	TAILQ_ENTRY(hvn_tx_desc)	txd_entry;
 };
 
+struct hvn_softc;
+
+struct hvn_tx_ring {
+	struct hvn_softc		*txr_softc;
+	struct vmbus_channel		*txr_chan;
+
+	uint32_t			txr_avail;
+	kmutex_t			txr_list_lock;
+	kcondvar_t			txr_list_cv;
+	TAILQ_HEAD(, hvn_tx_desc)	txr_list;
+	struct hvn_tx_desc		txr_desc[HVN_TX_DESC];
+	uint8_t				*txr_msgs;
+	struct hyperv_dma		txr_dma;
+} __aligned(CACHE_LINE_SIZE);
+
+struct hvn_rx_ring {
+	struct hvn_softc		*rxr_softc;
+	struct vmbus_channel		*rxr_chan;
+	struct hvn_tx_ring		*rxr_txr;
+
+	/* NVS */
+	uint8_t				*rxr_nvsbuf;
+} __aligned(CACHE_LINE_SIZE);
+
 struct hvn_softc {
 	device_t			sc_dev;
 
 	struct vmbus_softc		*sc_vmbus;
-	struct vmbus_channel		*sc_chan;
+	struct vmbus_channel		*sc_prichan;
 	bus_dma_tag_t			sc_dmat;
 
 	struct ethercom			sc_ec;
@@ -141,7 +165,8 @@ struct hvn_softc {
 	int				sc_promisc;
 
 	uint32_t			sc_flags;
-#define	HVN_SCF_ATTACHED	__BIT(0)
+#define	HVN_SCF_ATTACHED		__BIT(0)
+#define	HVN_SCF_RXBUF_CONNECTED		__BIT(1)
 
 	/* NVS protocol */
 	int				sc_proto;
@@ -167,16 +192,12 @@ struct hvn_softc {
 	int				sc_rx_size;
 	uint32_t			sc_rx_hndl;
 	struct hyperv_dma		sc_rx_dma;
+	struct hvn_rx_ring		*sc_rxr;
+	int				sc_nrxr;
 
 	/* Tx ring */
-	uint32_t			sc_tx_avail;
-	kmutex_t			sc_txd_list_lock;
-	kcondvar_t			sc_txd_list_cv;
-	TAILQ_HEAD(, hvn_tx_desc)	sc_txd_list;
-	struct hvn_tx_desc		sc_tx_desc[HVN_TX_DESC];
-	bus_dmamap_t			sc_tx_rmap;
-	uint8_t				*sc_tx_msgs;
-	bus_dma_segment_t		sc_tx_mseg;
+	struct hvn_tx_ring		*sc_txr;
+	int				sc_ntxr;
 };
 
 #define SC2IFP(_sc_)	(&(_sc_)->sc_ec.ec_if)
@@ -197,36 +218,40 @@ static int	hvn_iff(struct hvn_softc *);
 static int	hvn_init(struct ifnet *);
 static void	hvn_stop(struct ifnet *, int);
 static void	hvn_start(struct ifnet *);
-static int	hvn_encap(struct hvn_softc *, struct mbuf *,
+static int	hvn_encap(struct hvn_tx_ring *, struct mbuf *,
 		    struct hvn_tx_desc **);
-static void	hvn_decap(struct hvn_softc *, struct hvn_tx_desc *);
-static void	hvn_txeof(struct hvn_softc *, uint64_t);
-static int	hvn_rx_ring_create(struct hvn_softc *);
+static void	hvn_decap(struct hvn_tx_ring *, struct hvn_tx_desc *);
+static void	hvn_txeof(struct hvn_tx_ring *, uint64_t);
+static int	hvn_rx_ring_create(struct hvn_softc *, int);
 static int	hvn_rx_ring_destroy(struct hvn_softc *);
-static int	hvn_tx_ring_create(struct hvn_softc *);
+static int	hvn_tx_ring_create(struct hvn_softc *, int);
 static void	hvn_tx_ring_destroy(struct hvn_softc *);
-static int	hvn_txd_peek(struct hvn_softc *);
+static int	hvn_txd_peek(struct hvn_tx_ring *);
 static struct hvn_tx_desc *
-		hvn_txd_get(struct hvn_softc *);
-static void	hvn_txd_put(struct hvn_softc *, struct hvn_tx_desc *);
+		hvn_txd_get(struct hvn_tx_ring *);
+static void	hvn_txd_put(struct hvn_tx_ring *, struct hvn_tx_desc *);
 static int	hvn_set_capabilities(struct hvn_softc *);
 static int	hvn_get_lladdr(struct hvn_softc *, uint8_t *);
 static void	hvn_get_link_status(struct hvn_softc *);
+static int	hvn_channel_attach(struct hvn_softc *, struct vmbus_channel *);
+static void	hvn_channel_detach(struct hvn_softc *, struct vmbus_channel *);
 
 /* NSVP */
 static int	hvn_nvs_attach(struct hvn_softc *);
+static int	hvn_nvs_connect_rxbuf(struct hvn_softc *);
+static int	hvn_nvs_disconnect_rxbuf(struct hvn_softc *);
 static void	hvn_nvs_intr(void *);
 static int	hvn_nvs_cmd(struct hvn_softc *, void *, size_t, uint64_t, int);
-static int	hvn_nvs_ack(struct hvn_softc *, uint64_t);
+static int	hvn_nvs_ack(struct hvn_rx_ring *, uint64_t);
 static void	hvn_nvs_detach(struct hvn_softc *);
 
 /* RNDIS */
 static int	hvn_rndis_attach(struct hvn_softc *);
 static int	hvn_rndis_cmd(struct hvn_softc *, struct rndis_cmd *, int);
-static void	hvn_rndis_input(struct hvn_softc *, uint64_t, void *);
-static void	hvn_rxeof(struct hvn_softc *, uint8_t *, uint32_t);
+static void	hvn_rndis_input(struct hvn_rx_ring *, uint64_t, void *);
+static void	hvn_rxeof(struct hvn_rx_ring *, uint8_t *, uint32_t);
 static void	hvn_rndis_complete(struct hvn_softc *, uint8_t *, uint32_t);
-static int	hvn_rndis_output(struct hvn_softc *, struct hvn_tx_desc *);
+static int	hvn_rndis_output(struct hvn_tx_ring *, struct hvn_tx_desc *);
 static void	hvn_rndis_status(struct hvn_softc *, uint8_t *, uint32_t);
 static int	hvn_rndis_query(struct hvn_softc *, uint32_t, void *, size_t *);
 static int	hvn_rndis_set(struct hvn_softc *, uint32_t, void *, size_t);
@@ -251,29 +276,36 @@ hvn_attach(device_t parent, device_t self, void *aux)
 	struct vmbus_attach_args *aa = aux;
 	struct ifnet *ifp = SC2IFP(sc);
 	uint8_t enaddr[ETHER_ADDR_LEN];
-	int error;
+	int tx_ring_cnt, ring_cnt, error;
 
 	sc->sc_dev = self;
 	sc->sc_vmbus = (struct vmbus_softc *)device_private(parent);
-	sc->sc_chan = aa->aa_chan;
+	sc->sc_prichan = aa->aa_chan;
 	sc->sc_dmat = sc->sc_vmbus->sc_dmat;
 
 	aprint_naive("\n");
 	aprint_normal(": Hyper-V NetVSC\n");
 
-	if (hvn_nvs_attach(sc)) {
-		aprint_error_dev(self, "failed to init NVSP\n");
+	tx_ring_cnt = ring_cnt = 1;
+
+	if (hvn_tx_ring_create(sc, tx_ring_cnt)) {
+		aprint_error_dev(self, "failed to create Tx ring\n");
 		return;
 	}
 
-	if (hvn_rx_ring_create(sc)) {
+	if (hvn_rx_ring_create(sc, ring_cnt)) {
 		aprint_error_dev(self, "failed to create Rx ring\n");
-		goto fail1;
+		goto destroy_tx_ring;
 	}
 
-	if (hvn_tx_ring_create(sc)) {
-		aprint_error_dev(self, "failed to create Tx ring\n");
-		goto fail2;
+	if (hvn_channel_attach(sc, sc->sc_prichan)) {
+		aprint_error_dev(self, "failed to attach primary channel\n");
+		goto destroy_rx_ring;
+	}
+
+	if (hvn_nvs_attach(sc)) {
+		aprint_error_dev(self, "failed to init NVSP\n");
+		goto detach_prichan;
 	}
 
 	strlcpy(ifp->if_xname, device_xname(sc->sc_dev), IFNAMSIZ);
@@ -313,14 +345,14 @@ hvn_attach(device_t parent, device_t self, void *aux)
 	error = if_initialize(ifp);
 	if (error) {
 		aprint_error_dev(self, "if_initialize failed(%d)\n", error);
-		goto fail3;
+		goto detach_nvs;
 	}
 	sc->sc_ipq = if_percpuq_create(ifp);
 	if_deferred_start_init(ifp, NULL);
 
 	if (hvn_rndis_attach(sc)) {
 		aprint_error_dev(self, "failed to init RNDIS\n");
-		goto fail3;
+		goto destroy_if_percpuq;
 	}
 
 	aprint_normal_dev(self, "NVS %d.%d NDIS %d.%d\n",
@@ -329,13 +361,13 @@ hvn_attach(device_t parent, device_t self, void *aux)
 
 	if (hvn_set_capabilities(sc)) {
 		aprint_error_dev(self, "failed to setup offloading\n");
-		goto fail4;
+		goto detach_rndis;
 	}
 
 	if (hvn_get_lladdr(sc, enaddr)) {
 		aprint_error_dev(self,
 		    "failed to obtain an ethernet address\n");
-		goto fail4;
+		goto detach_rndis;
 	}
 	aprint_normal_dev(self, "Ethernet address %s\n", ether_sprintf(enaddr));
 
@@ -350,13 +382,18 @@ hvn_attach(device_t parent, device_t self, void *aux)
 	SET(sc->sc_flags, HVN_SCF_ATTACHED);
 	return;
 
-fail4:	hvn_rndis_detach(sc);
+detach_rndis:
+	hvn_rndis_detach(sc);
+destroy_if_percpuq:
 	if_percpuq_destroy(sc->sc_ipq);
-fail3:	ifmedia_fini(&sc->sc_media);
-	mutex_destroy(&sc->sc_media_lock);
+detach_nvs:
+	hvn_nvs_detach(sc);
+detach_prichan:
+	hvn_channel_detach(sc, sc->sc_prichan);
+destroy_rx_ring:
+	hvn_rx_ring_destroy(sc);
+destroy_tx_ring:
 	hvn_tx_ring_destroy(sc);
-fail2:	hvn_rx_ring_destroy(sc);
-fail1:	hvn_nvs_detach(sc);
 }
 
 static int
@@ -380,9 +417,10 @@ hvn_detach(device_t self, int flags)
 	if_percpuq_destroy(sc->sc_ipq);
 
 	hvn_rndis_detach(sc);
+	hvn_nvs_detach(sc);
+	hvn_channel_detach(sc, sc->sc_prichan);
 	hvn_rx_ring_destroy(sc);
 	hvn_tx_ring_destroy(sc);
-	hvn_nvs_detach(sc);
 
 	return 0;
 }
@@ -494,6 +532,7 @@ static void
 hvn_start(struct ifnet *ifp)
 {
 	struct hvn_softc *sc = IFP2SC(ifp);
+	struct hvn_tx_ring *txr = &sc->sc_txr[0];
 	struct hvn_tx_desc *txd;
 	struct mbuf *m;
 
@@ -501,7 +540,7 @@ hvn_start(struct ifnet *ifp)
 		return;
 
 	for (;;) {
-		if (!hvn_txd_peek(sc)) {
+		if (!hvn_txd_peek(txr)) {
 			/* transient */
 			ifp->if_flags |= IFF_OACTIVE;
 			break;
@@ -511,15 +550,15 @@ hvn_start(struct ifnet *ifp)
 		if (m == NULL)
 			break;
 
-		if (hvn_encap(sc, m, &txd)) {
+		if (hvn_encap(txr, m, &txd)) {
 			/* the chain is too large */
 			if_statinc(ifp, if_oerrors);
 			m_freem(m);
 			continue;
 		}
 
-		if (hvn_rndis_output(sc, txd)) {
-			hvn_decap(sc, txd);
+		if (hvn_rndis_output(txr, txd)) {
+			hvn_decap(txr, txd);
 			if_statinc(ifp, if_oerrors);
 			m_freem(m);
 			continue;
@@ -553,15 +592,16 @@ hvn_rndis_pktinfo_append(struct rndis_packet_msg *pkt, size_t pktsize,
 }
 
 static int
-hvn_encap(struct hvn_softc *sc, struct mbuf *m, struct hvn_tx_desc **txd0)
+hvn_encap(struct hvn_tx_ring *txr, struct mbuf *m, struct hvn_tx_desc **txd0)
 {
+	struct hvn_softc *sc = txr->txr_softc;
 	struct hvn_tx_desc *txd;
 	struct rndis_packet_msg *pkt;
 	bus_dma_segment_t *seg;
 	size_t pktlen;
 	int i, rv;
 
-	txd = hvn_txd_get(sc);
+	txd = hvn_txd_get(txr);
 	pkt = txd->txd_req;
 	memset(pkt, 0, HVN_RNDIS_PKT_LEN);
 	pkt->rm_type = REMOTE_NDIS_PACKET_MSG;
@@ -639,8 +679,9 @@ hvn_encap(struct hvn_softc *sc, struct mbuf *m, struct hvn_tx_desc **txd0)
 }
 
 static void
-hvn_decap(struct hvn_softc *sc, struct hvn_tx_desc *txd)
+hvn_decap(struct hvn_tx_ring *txr, struct hvn_tx_desc *txd)
 {
+	struct hvn_softc *sc = txr->txr_softc;
 	struct ifnet *ifp = SC2IFP(sc);
 
 	bus_dmamap_sync(sc->sc_dmat, txd->txd_dmap,
@@ -649,13 +690,14 @@ hvn_decap(struct hvn_softc *sc, struct hvn_tx_desc *txd)
 	bus_dmamap_unload(sc->sc_dmat, txd->txd_dmap);
 	txd->txd_buf = NULL;
 	txd->txd_nsge = 0;
-	hvn_txd_put(sc, txd);
+	hvn_txd_put(txr, txd);
 	ifp->if_flags &= ~IFF_OACTIVE;
 }
 
 static void
-hvn_txeof(struct hvn_softc *sc, uint64_t tid)
+hvn_txeof(struct hvn_tx_ring *txr, uint64_t tid)
 {
+	struct hvn_softc *sc = txr->txr_softc;
 	struct ifnet *ifp = SC2IFP(sc);
 	struct hvn_tx_desc *txd;
 	struct mbuf *m;
@@ -670,7 +712,7 @@ hvn_txeof(struct hvn_softc *sc, uint64_t tid)
 		return;
 	}
 
-	txd = &sc->sc_tx_desc[id];
+	txd = &txr->txr_desc[id];
 
 	if ((m = txd->txd_buf) == NULL) {
 		device_printf(sc->sc_dev, "no mbuf @%u\n", id);
@@ -685,21 +727,20 @@ hvn_txeof(struct hvn_softc *sc, uint64_t tid)
 	m_freem(m);
 	if_statinc(ifp, if_opackets);
 
-	hvn_txd_put(sc, txd);
+	hvn_txd_put(txr, txd);
 	ifp->if_flags &= ~IFF_OACTIVE;
 }
 
 static int
-hvn_rx_ring_create(struct hvn_softc *sc)
+hvn_rx_ring_create(struct hvn_softc *sc, int ring_cnt)
 {
-	struct hvn_nvs_rxbuf_conn cmd;
-	struct hvn_nvs_rxbuf_conn_resp *rsp;
-	uint64_t tid;
+	struct hvn_rx_ring *rxr;
+	int i;
 
 	if (sc->sc_proto <= HVN_NVS_PROTO_VERSION_2)
 		sc->sc_rx_size = 15 * 1024 * 1024;	/* 15MB */
 	else
-		sc->sc_rx_size = 16 * 1024 * 1024; 	/* 16MB */
+		sc->sc_rx_size = 16 * 1024 * 1024;	/* 16MB */
 	sc->sc_rx_ring = hyperv_dma_alloc(sc->sc_dmat, &sc->sc_rx_dma,
 	    sc->sc_rx_size, PAGE_SIZE, PAGE_SIZE, sc->sc_rx_size / PAGE_SIZE,
 	    HYPERV_DMA_SLEEPOK);
@@ -708,141 +749,112 @@ hvn_rx_ring_create(struct hvn_softc *sc)
 		    device_xname(sc->sc_dev));
 		return -1;
 	}
-	if (vmbus_handle_alloc(sc->sc_chan, &sc->sc_rx_dma, sc->sc_rx_size,
-	    &sc->sc_rx_hndl)) {
-		DPRINTF("%s: failed to obtain a PA handle\n",
-		    device_xname(sc->sc_dev));
-		goto errout;
+
+	sc->sc_rxr = kmem_zalloc(sizeof(*rxr) * ring_cnt, KM_SLEEP);
+	sc->sc_nrxr = ring_cnt;
+
+	for (i = 0; i < sc->sc_nrxr; i++) {
+		rxr = &sc->sc_rxr[i];
+		rxr->rxr_softc = sc;
+		if (i < sc->sc_ntxr)
+			rxr->rxr_txr = &sc->sc_txr[i];
+
+		rxr->rxr_nvsbuf = kmem_zalloc(HVN_NVS_BUFSIZE, KM_SLEEP);
+		if (rxr->rxr_nvsbuf == NULL) {
+			DPRINTF("%s: failed to allocate channel data buffer\n",
+			    device_xname(sc->sc_dev));
+			goto errout;
+		}
 	}
 
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.nvs_type = HVN_NVS_TYPE_RXBUF_CONN;
-	cmd.nvs_gpadl = sc->sc_rx_hndl;
-	cmd.nvs_sig = HVN_NVS_RXBUF_SIG;
-
-	tid = atomic_inc_uint_nv(&sc->sc_nvstid);
-	if (hvn_nvs_cmd(sc, &cmd, sizeof(cmd), tid, 100))
-		goto errout;
-
-	rsp = (struct hvn_nvs_rxbuf_conn_resp *)&sc->sc_nvsrsp;
-	if (rsp->nvs_status != HVN_NVS_STATUS_OK) {
-		DPRINTF("%s: failed to set up the Rx ring\n",
-		    device_xname(sc->sc_dev));
-		goto errout;
-	}
-	if (rsp->nvs_nsect > 1) {
-		DPRINTF("%s: invalid number of Rx ring sections: %u\n",
-		    device_xname(sc->sc_dev), rsp->nvs_nsect);
-		hvn_rx_ring_destroy(sc);
-		return -1;
-	}
 	return 0;
-
- errout:
-	if (sc->sc_rx_hndl) {
-		vmbus_handle_free(sc->sc_chan, sc->sc_rx_hndl);
-		sc->sc_rx_hndl = 0;
-	}
-	if (sc->sc_rx_ring) {
-		hyperv_dma_free(sc->sc_dmat, &sc->sc_rx_dma);
-		sc->sc_rx_ring = NULL;
-	}
+ 
+errout:
+	hvn_rx_ring_destroy(sc);
 	return -1;
 }
 
 static int
 hvn_rx_ring_destroy(struct hvn_softc *sc)
 {
-	struct hvn_nvs_rxbuf_disconn cmd;
-	uint64_t tid;
+	struct hvn_rx_ring *rxr;
+	int i;
 
-	if (sc->sc_rx_ring == NULL)
-		return 0;
-
-	memset(&cmd, 0, sizeof(cmd));
-	cmd.nvs_type = HVN_NVS_TYPE_RXBUF_DISCONN;
-	cmd.nvs_sig = HVN_NVS_RXBUF_SIG;
-
-	tid = atomic_inc_uint_nv(&sc->sc_nvstid);
-	if (hvn_nvs_cmd(sc, &cmd, sizeof(cmd), tid, 0))
-		return -1;
-
-	delay(100);
-
-	vmbus_handle_free(sc->sc_chan, sc->sc_rx_hndl);
-	sc->sc_rx_hndl = 0;
-
-	hyperv_dma_free(sc->sc_dmat, &sc->sc_rx_dma);
-	sc->sc_rx_ring = NULL;
+	if (sc->sc_rxr != NULL) {
+		for (i = 0; i < sc->sc_nrxr; i++) {
+			rxr = &sc->sc_rxr[i];
+			if (rxr->rxr_nvsbuf != NULL) {
+				kmem_free(rxr->rxr_nvsbuf, HVN_NVS_BUFSIZE);
+				rxr->rxr_nvsbuf = NULL;
+			}
+		}
+		kmem_free(sc->sc_rxr, sizeof(*rxr) * sc->sc_nrxr);
+		sc->sc_rxr = NULL;
+		sc->sc_nrxr = 0;
+	}
+	if (sc->sc_rx_ring != NULL) {
+		hyperv_dma_free(sc->sc_dmat, &sc->sc_rx_dma);
+		sc->sc_rx_ring = NULL;
+	}
 
 	return 0;
 }
 
 static int
-hvn_tx_ring_create(struct hvn_softc *sc)
+hvn_tx_ring_create(struct hvn_softc *sc, int ring_cnt)
 {
-	const int dmaflags = cold ? BUS_DMA_NOWAIT : BUS_DMA_WAITOK;
+	struct hvn_tx_ring *txr;
 	struct hvn_tx_desc *txd;
 	bus_dma_segment_t *seg;
 	size_t msgsize;
-	int i, rsegs;
+	int i, j;
 	paddr_t pa;
-
-	mutex_init(&sc->sc_txd_list_lock, MUTEX_DEFAULT, IPL_NET);
-	cv_init(&sc->sc_txd_list_cv, "hvntxdcv");
-	TAILQ_INIT(&sc->sc_txd_list);
 
 	msgsize = roundup(HVN_RNDIS_PKT_LEN, 128);
 
-	/* Allocate memory to store RNDIS messages */
-	if (bus_dmamem_alloc(sc->sc_dmat, msgsize * HVN_TX_DESC, PAGE_SIZE, 0,
-	    &sc->sc_tx_mseg, 1, &rsegs, dmaflags)) {
-		DPRINTF("%s: failed to allocate memory for RDNIS messages\n",
-		    device_xname(sc->sc_dev));
-		goto errout;
-	}
-	if (bus_dmamem_map(sc->sc_dmat, &sc->sc_tx_mseg, 1, msgsize *
-	    HVN_TX_DESC, (void **)&sc->sc_tx_msgs, dmaflags)) {
-		DPRINTF("%s: failed to establish mapping for RDNIS messages\n",
-		    device_xname(sc->sc_dev));
-		goto errout;
-	}
-	memset(sc->sc_tx_msgs, 0, msgsize * HVN_TX_DESC);
-	if (bus_dmamap_create(sc->sc_dmat, msgsize * HVN_TX_DESC, 1,
-	    msgsize * HVN_TX_DESC, 0, dmaflags, &sc->sc_tx_rmap)) {
-		DPRINTF("%s: failed to create map for RDNIS messages\n",
-		    device_xname(sc->sc_dev));
-		goto errout;
-	}
-	if (bus_dmamap_load(sc->sc_dmat, sc->sc_tx_rmap, sc->sc_tx_msgs,
-	    msgsize * HVN_TX_DESC, NULL, dmaflags)) {
-		DPRINTF("%s: failed to create map for RDNIS messages\n",
-		    device_xname(sc->sc_dev));
-		goto errout;
-	}
+	sc->sc_txr = kmem_zalloc(sizeof(*txr) * ring_cnt, KM_SLEEP);
+	sc->sc_ntxr = ring_cnt;
 
-	for (i = 0; i < HVN_TX_DESC; i++) {
-		txd = &sc->sc_tx_desc[i];
-		if (bus_dmamap_create(sc->sc_dmat, HVN_TX_PKT_SIZE,
-		    HVN_TX_FRAGS, HVN_TX_FRAG_SIZE, PAGE_SIZE, dmaflags,
-		    &txd->txd_dmap)) {
-			DPRINTF("%s: failed to create map for TX descriptors\n",
-			    device_xname(sc->sc_dev));
+	for (j = 0; j < ring_cnt; j++) {
+		txr = &sc->sc_txr[j];
+		txr->txr_softc = sc;
+
+		mutex_init(&txr->txr_list_lock, MUTEX_DEFAULT, IPL_NET);
+		cv_init(&txr->txr_list_cv, "hvntxdcv");
+		TAILQ_INIT(&txr->txr_list);
+
+		/* Allocate memory to store RNDIS messages */
+		txr->txr_msgs = hyperv_dma_alloc(sc->sc_dmat, &txr->txr_dma,
+		    msgsize * HVN_TX_DESC, PAGE_SIZE, 0, 1, HYPERV_DMA_SLEEPOK);
+		if (txr->txr_msgs == NULL) {
+			DPRINTF("%s: failed to allocate memory for RDNIS "
+			    "messages\n", device_xname(sc->sc_dev));
 			goto errout;
 		}
-		seg = &sc->sc_tx_rmap->dm_segs[0];
-		pa = seg->ds_addr + (msgsize * i);
-		txd->txd_gpa.gpa_page = atop(pa);
-		txd->txd_gpa.gpa_ofs = pa & PAGE_MASK;
-		txd->txd_gpa.gpa_len = msgsize;
-		txd->txd_req = (void *)(sc->sc_tx_msgs + (msgsize * i));
-		txd->txd_id = i + HVN_NVS_CHIM_SIG;
-		hvn_txd_put(sc, txd);
+
+		for (i = 0; i < HVN_TX_DESC; i++) {
+			txd = &txr->txr_desc[i];
+			if (bus_dmamap_create(sc->sc_dmat, HVN_TX_PKT_SIZE,
+			    HVN_TX_FRAGS, HVN_TX_FRAG_SIZE, PAGE_SIZE,
+			    BUS_DMA_WAITOK, &txd->txd_dmap)) {
+				DPRINTF("%s: failed to create map for TX "
+				    "descriptors\n", device_xname(sc->sc_dev));
+				goto errout;
+			}
+			seg = &txr->txr_dma.map->dm_segs[0];
+			pa = seg->ds_addr + (msgsize * i);
+			txd->txd_gpa.gpa_page = atop(pa);
+			txd->txd_gpa.gpa_ofs = pa & PAGE_MASK;
+			txd->txd_gpa.gpa_len = msgsize;
+			txd->txd_req = (void *)(txr->txr_msgs + (msgsize * i));
+			txd->txd_id = i + HVN_NVS_CHIM_SIG;
+			hvn_txd_put(txr, txd);
+		}
 	}
 
 	return 0;
 
- errout:
+errout:
 	hvn_tx_ring_destroy(sc);
 	return -1;
 }
@@ -850,78 +862,77 @@ hvn_tx_ring_create(struct hvn_softc *sc)
 static void
 hvn_tx_ring_destroy(struct hvn_softc *sc)
 {
+	struct hvn_tx_ring *txr;
 	struct hvn_tx_desc *txd;
-	int i;
+	int i, j;
 
-	for (i = 0; i < HVN_TX_DESC; i++) {
-		txd = &sc->sc_tx_desc[i];
-		if (txd->txd_dmap == NULL)
-			continue;
-		bus_dmamap_sync(sc->sc_dmat, txd->txd_dmap,
-		    0, txd->txd_dmap->dm_mapsize,
-		    BUS_DMASYNC_POSTWRITE);
-		bus_dmamap_unload(sc->sc_dmat, txd->txd_dmap);
-		bus_dmamap_destroy(sc->sc_dmat, txd->txd_dmap);
-		txd->txd_dmap = NULL;
-		if (txd->txd_buf == NULL)
-			continue;
-		m_freem(txd->txd_buf);
-		txd->txd_buf = NULL;
-	}
-	if (sc->sc_tx_rmap != NULL) {
-		bus_dmamap_sync(sc->sc_dmat, sc->sc_tx_rmap,
-		    0, sc->sc_tx_rmap->dm_mapsize,
-		    BUS_DMASYNC_POSTWRITE);
-		bus_dmamap_unload(sc->sc_dmat, sc->sc_tx_rmap);
-		bus_dmamap_destroy(sc->sc_dmat, sc->sc_tx_rmap);
-		sc->sc_tx_rmap = NULL;
-	}
-	if (sc->sc_tx_msgs != NULL) {
-		size_t msgsize = roundup(HVN_RNDIS_PKT_LEN, 128);
+	if (sc->sc_txr == NULL)
+		return;
 
-		bus_dmamem_unmap(sc->sc_dmat, sc->sc_tx_msgs,
-		    msgsize * HVN_TX_DESC);
-		bus_dmamem_free(sc->sc_dmat, &sc->sc_tx_mseg, 1);
-		sc->sc_tx_msgs = NULL;
+	for (j = 0; j < sc->sc_ntxr; j++) {
+		txr = &sc->sc_txr[j];
+
+		for (i = 0; i < HVN_TX_DESC; i++) {
+			txd = &txr->txr_desc[i];
+			if (txd->txd_dmap == NULL)
+				continue;
+			bus_dmamap_sync(sc->sc_dmat, txd->txd_dmap,
+			    0, txd->txd_dmap->dm_mapsize,
+			    BUS_DMASYNC_POSTWRITE);
+			bus_dmamap_unload(sc->sc_dmat, txd->txd_dmap);
+			bus_dmamap_destroy(sc->sc_dmat, txd->txd_dmap);
+			txd->txd_dmap = NULL;
+			if (txd->txd_buf == NULL)
+				continue;
+			m_freem(txd->txd_buf);
+			txd->txd_buf = NULL;
+		}
+		if (txr->txr_msgs != NULL) {
+			hyperv_dma_free(sc->sc_dmat, &txr->txr_dma);
+			txr->txr_msgs = NULL;
+		}
 	}
+
+	kmem_free(sc->sc_txr, sizeof(*txr) * sc->sc_ntxr);
+	sc->sc_txr = NULL;
 }
 
 static int
-hvn_txd_peek(struct hvn_softc *sc)
+hvn_txd_peek(struct hvn_tx_ring *txr)
 {
 	int avail;
 
-	mutex_enter(&sc->sc_txd_list_lock);
-	avail = sc->sc_tx_avail;
-	mutex_exit(&sc->sc_txd_list_lock);
+	mutex_enter(&txr->txr_list_lock);
+	avail = txr->txr_avail;
+	mutex_exit(&txr->txr_list_lock);
 
 	return avail;
 }
 
 static struct hvn_tx_desc *
-hvn_txd_get(struct hvn_softc *sc)
+hvn_txd_get(struct hvn_tx_ring *txr)
 {
 	struct hvn_tx_desc *txd;
 
-	mutex_enter(&sc->sc_txd_list_lock);
-	while ((txd = TAILQ_FIRST(&sc->sc_txd_list)) == NULL)
-		cv_wait(&sc->sc_txd_list_cv, &sc->sc_txd_list_lock);
-	TAILQ_REMOVE(&sc->sc_txd_list, txd, txd_entry);
-	sc->sc_tx_avail--;
-	mutex_exit(&sc->sc_txd_list_lock);
+	mutex_enter(&txr->txr_list_lock);
+	while ((txd = TAILQ_FIRST(&txr->txr_list)) == NULL)
+		cv_wait(&txr->txr_list_cv, &txr->txr_list_lock);
+	TAILQ_REMOVE(&txr->txr_list, txd, txd_entry);
+	txr->txr_avail--;
+	mutex_exit(&txr->txr_list_lock);
 
 	return txd;
 }
 
 static void
-hvn_txd_put(struct hvn_softc *sc, struct hvn_tx_desc *txd)
+hvn_txd_put(struct hvn_tx_ring *txr, struct hvn_tx_desc *txd)
 {
 
-	mutex_enter(&sc->sc_txd_list_lock);
-	TAILQ_INSERT_TAIL(&sc->sc_txd_list, txd, txd_entry);
-	sc->sc_tx_avail++;
-	cv_signal(&sc->sc_txd_list_cv);
-	mutex_exit(&sc->sc_txd_list_lock);
+	mutex_enter(&txr->txr_list_lock);
+	TAILQ_INSERT_TAIL(&txr->txr_list, txd, txd_entry);
+	txr->txr_avail++;
+	cv_signal(&txr->txr_list_cv);
+	mutex_exit(&txr->txr_list_lock);
 }
 
 static int
@@ -949,6 +960,56 @@ hvn_get_link_status(struct hvn_softc *sc)
 }
 
 static int
+hvn_channel_attach(struct hvn_softc *sc, struct vmbus_channel *chan)
+{
+	struct hvn_rx_ring *rxr;
+	struct hvn_tx_ring *txr;
+	uint32_t ringsize;
+	int idx;
+
+	idx = chan->ch_subidx;
+	if (idx < 0 || idx >= sc->sc_nrxr) {
+		DPRINTF("%s: invalid sub-channel %u\n",
+		    device_xname(sc->sc_dev), idx);
+		return -1;
+	}
+
+	rxr = &sc->sc_rxr[idx];
+	rxr->rxr_chan = chan;
+
+	if (idx < sc->sc_ntxr) {
+		txr = &sc->sc_txr[idx];
+		txr->txr_chan = chan;
+	}
+
+	/* XXX Bind this channel to a proper CPU. */
+
+	/* We need to be able to fit all RNDIS control and data messages */
+	ringsize = HVN_RNDIS_CTLREQS *
+	    (sizeof(struct hvn_nvs_rndis) + sizeof(struct vmbus_gpa)) +
+	    HVN_TX_DESC * (sizeof(struct hvn_nvs_rndis) +
+		(HVN_TX_FRAGS + 1) * sizeof(struct vmbus_gpa));
+
+	chan->ch_flags &= ~CHF_BATCHED;
+
+	/* Associate our interrupt handler with the channel */
+	if (vmbus_channel_open(chan, ringsize, NULL, 0, hvn_nvs_intr, rxr)) {
+		DPRINTF("%s: failed to open channel\n",
+		    device_xname(sc->sc_dev));
+		return -1;
+	}
+
+	return 0;
+}
+
+static void
+hvn_channel_detach(struct hvn_softc *sc, struct vmbus_channel *chan)
+{
+
+	vmbus_channel_close(chan);
+}
+
+static int
 hvn_nvs_attach(struct hvn_softc *sc)
 {
 	static const uint32_t protos[] = {
@@ -961,28 +1022,9 @@ hvn_nvs_attach(struct hvn_softc *sc)
 	struct hvn_nvs_init_resp *rsp;
 	struct hvn_nvs_ndis_init ncmd;
 	struct hvn_nvs_ndis_conf ccmd;
-	uint32_t ndisver, ringsize;
+	uint32_t ndisver;
 	uint64_t tid;
 	int i;
-
-	sc->sc_nvsbuf = kmem_zalloc(HVN_NVS_BUFSIZE, KM_SLEEP);
-
-	/* We need to be able to fit all RNDIS control and data messages */
-	ringsize = HVN_RNDIS_CTLREQS *
-	    (sizeof(struct hvn_nvs_rndis) + sizeof(struct vmbus_gpa)) +
-	    HVN_TX_DESC * (sizeof(struct hvn_nvs_rndis) +
-	    (HVN_TX_FRAGS + 1) * sizeof(struct vmbus_gpa));
-
-	sc->sc_chan->ch_flags &= ~CHF_BATCHED;
-
-	/* Associate our interrupt handler with the channel */
-	if (vmbus_channel_open(sc->sc_chan, ringsize, NULL, 0,
-	    hvn_nvs_intr, sc)) {
-		DPRINTF("%s: failed to open channel\n",
-		    device_xname(sc->sc_dev));
-		kmem_free(sc->sc_nvsbuf, HVN_NVS_BUFSIZE);
-		return -1;
-	}
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.nvs_type = HVN_NVS_TYPE_INIT;
@@ -1030,13 +1072,93 @@ hvn_nvs_attach(struct hvn_softc *sc)
 
 	sc->sc_ndisver = ndisver;
 
+	hvn_nvs_connect_rxbuf(sc);
+
+	return 0;
+}
+
+static int
+hvn_nvs_connect_rxbuf(struct hvn_softc *sc)
+{
+	struct hvn_nvs_rxbuf_conn cmd;
+	struct hvn_nvs_rxbuf_conn_resp *rsp;
+	uint64_t tid;
+
+	if (vmbus_handle_alloc(sc->sc_prichan, &sc->sc_rx_dma, sc->sc_rx_size,
+	    &sc->sc_rx_hndl)) {
+		DPRINTF("%s: failed to obtain a PA handle\n",
+		    device_xname(sc->sc_dev));
+		return -1;
+	}
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.nvs_type = HVN_NVS_TYPE_RXBUF_CONN;
+	cmd.nvs_gpadl = sc->sc_rx_hndl;
+	cmd.nvs_sig = HVN_NVS_RXBUF_SIG;
+
+	tid = atomic_inc_uint_nv(&sc->sc_nvstid);
+	if (hvn_nvs_cmd(sc, &cmd, sizeof(cmd), tid, 100))
+		goto errout;
+
+	rsp = (struct hvn_nvs_rxbuf_conn_resp *)&sc->sc_nvsrsp;
+	if (rsp->nvs_status != HVN_NVS_STATUS_OK) {
+		DPRINTF("%s: failed to set up the Rx ring\n",
+		    device_xname(sc->sc_dev));
+		goto errout;
+	}
+
+	SET(sc->sc_flags, HVN_SCF_RXBUF_CONNECTED);
+
+	if (rsp->nvs_nsect > 1) {
+		DPRINTF("%s: invalid number of Rx ring sections: %u\n",
+		    device_xname(sc->sc_dev), rsp->nvs_nsect);
+		goto errout;
+	}
+
+	return 0;
+
+errout:
+	hvn_nvs_disconnect_rxbuf(sc);
+	return -1;
+}
+
+static int
+hvn_nvs_disconnect_rxbuf(struct hvn_softc *sc)
+{
+	struct hvn_nvs_rxbuf_disconn cmd;
+	uint64_t tid;
+	int error;
+
+	if (ISSET(sc->sc_flags, HVN_SCF_RXBUF_CONNECTED)) {
+		memset(&cmd, 0, sizeof(cmd));
+		cmd.nvs_type = HVN_NVS_TYPE_RXBUF_DISCONN;
+		cmd.nvs_sig = HVN_NVS_RXBUF_SIG;
+
+		tid = atomic_inc_uint_nv(&sc->sc_nvstid);
+		error = hvn_nvs_cmd(sc, &cmd, sizeof(cmd), tid, 0);
+		if (error) {
+			device_printf(sc->sc_dev,
+			    "failed to send rxbuf disconn: %d", error);
+		}
+		CLR(sc->sc_flags, HVN_SCF_RXBUF_CONNECTED);
+
+		delay(100);
+	}
+
+	if (sc->sc_prichan->ch_sc->sc_proto < VMBUS_VERSION_WIN10 &&
+	    sc->sc_rx_hndl) {
+		vmbus_handle_free(sc->sc_prichan, sc->sc_rx_hndl);
+		sc->sc_rx_hndl = 0;
+	}
+
 	return 0;
 }
 
 static void
 hvn_nvs_intr(void *arg)
 {
-	struct hvn_softc *sc = arg;
+	struct hvn_rx_ring *rxr = arg;
+	struct hvn_softc *sc = rxr->rxr_softc;
 	struct ifnet *ifp = SC2IFP(sc);
 	struct vmbus_chanpkt_hdr *cph;
 	const struct hvn_nvs_hdr *nvs;
@@ -1046,7 +1168,7 @@ hvn_nvs_intr(void *arg)
 	bool dotx = false;
 
 	for (;;) {
-		rv = vmbus_channel_recv(sc->sc_chan, sc->sc_nvsbuf,
+		rv = vmbus_channel_recv(rxr->rxr_chan, rxr->rxr_nvsbuf,
 		    HVN_NVS_BUFSIZE, &rlen, &rid, 1);
 		if (rv != 0 || rlen == 0) {
 			if (rv != EAGAIN)
@@ -1054,7 +1176,7 @@ hvn_nvs_intr(void *arg)
 				    "failed to receive an NVSP packet\n");
 			break;
 		}
-		cph = (struct vmbus_chanpkt_hdr *)sc->sc_nvsbuf;
+		cph = (struct vmbus_chanpkt_hdr *)rxr->rxr_nvsbuf;
 		nvs = (const struct hvn_nvs_hdr *)VMBUS_CHANPKT_CONST_DATA(cph);
 
 		if (cph->cph_type == VMBUS_CHANPKT_TYPE_COMP) {
@@ -1069,8 +1191,10 @@ hvn_nvs_intr(void *arg)
 				wakeup(&sc->sc_nvsrsp);
 				break;
 			case HVN_NVS_TYPE_RNDIS_ACK:
-				dotx = true;
-				hvn_txeof(sc, cph->cph_tid);
+				if (rxr->rxr_txr != NULL) {
+					dotx = true;
+					hvn_txeof(rxr->rxr_txr, cph->cph_tid);
+				}
 				break;
 			default:
 				device_printf(sc->sc_dev,
@@ -1081,7 +1205,7 @@ hvn_nvs_intr(void *arg)
 		} else if (cph->cph_type == VMBUS_CHANPKT_TYPE_RXBUF) {
 			switch (nvs->nvs_type) {
 			case HVN_NVS_TYPE_RNDIS:
-				hvn_rndis_input(sc, cph->cph_tid, cph);
+				hvn_rndis_input(rxr, cph->cph_tid, cph);
 				break;
 			default:
 				device_printf(sc->sc_dev,
@@ -1112,6 +1236,7 @@ static int
 hvn_nvs_cmd(struct hvn_softc *sc, void *cmd, size_t cmdsize, uint64_t tid,
     int timo)
 {
+	struct hvn_rx_ring *rxr = &sc->sc_rxr[0];	/* primary channel */
 	struct hvn_nvs_hdr *hdr = cmd;
 	int tries = 10;
 	int rv, s;
@@ -1119,7 +1244,7 @@ hvn_nvs_cmd(struct hvn_softc *sc, void *cmd, size_t cmdsize, uint64_t tid,
 	sc->sc_nvsdone = 0;
 
 	do {
-		rv = vmbus_channel_send(sc->sc_chan, cmd, cmdsize,
+		rv = vmbus_channel_send(rxr->rxr_chan, cmd, cmdsize,
 		    tid, VMBUS_CHANPKT_TYPE_INBAND,
 		    timo ? VMBUS_CHANPKT_FLAG_RC : 0);
 		if (rv == EAGAIN) {
@@ -1147,7 +1272,7 @@ hvn_nvs_cmd(struct hvn_softc *sc, void *cmd, size_t cmdsize, uint64_t tid,
 		if (cold) {
 			delay(1000);
 			s = splnet();
-			hvn_nvs_intr(sc);
+			hvn_nvs_intr(rxr);
 			splx(s);
 		} else
 			tsleep(sc->sc_nvsrsp, PRIBIO | PCATCH, "nvscmd",
@@ -1163,8 +1288,9 @@ hvn_nvs_cmd(struct hvn_softc *sc, void *cmd, size_t cmdsize, uint64_t tid,
 }
 
 static int
-hvn_nvs_ack(struct hvn_softc *sc, uint64_t tid)
+hvn_nvs_ack(struct hvn_rx_ring *rxr, uint64_t tid)
 {
+	struct hvn_softc *sc __unused = rxr->rxr_softc;
 	struct hvn_nvs_rndis_ack cmd;
 	int tries = 5;
 	int rv;
@@ -1172,7 +1298,7 @@ hvn_nvs_ack(struct hvn_softc *sc, uint64_t tid)
 	cmd.nvs_type = HVN_NVS_TYPE_RNDIS_ACK;
 	cmd.nvs_status = HVN_NVS_STATUS_OK;
 	do {
-		rv = vmbus_channel_send(sc->sc_chan, &cmd, sizeof(cmd),
+		rv = vmbus_channel_send(rxr->rxr_chan, &cmd, sizeof(cmd),
 		    tid, VMBUS_CHANPKT_TYPE_COMP, 0);
 		if (rv == EAGAIN)
 			delay(10);
@@ -1189,10 +1315,7 @@ static void
 hvn_nvs_detach(struct hvn_softc *sc)
 {
 
-	if (vmbus_channel_close(sc->sc_chan) == 0) {
-		kmem_free(sc->sc_nvsbuf, HVN_NVS_BUFSIZE);
-		sc->sc_nvsbuf = NULL;
-	}
+	hvn_nvs_disconnect_rxbuf(sc);
 }
 
 static inline struct rndis_cmd *
@@ -1422,6 +1545,7 @@ hvn_set_capabilities(struct hvn_softc *sc)
 static int
 hvn_rndis_cmd(struct hvn_softc *sc, struct rndis_cmd *rc, int timo)
 {
+	struct hvn_rx_ring *rxr = &sc->sc_rxr[0];	/* primary channel */
 	struct hvn_nvs_rndis *msg = &rc->rc_msg;
 	struct rndis_msghdr *hdr = rc->rc_req;
 	struct vmbus_gpa sgl[1];
@@ -1443,7 +1567,7 @@ hvn_rndis_cmd(struct hvn_softc *sc, struct rndis_cmd *rc, int timo)
 	hvn_submit_cmd(sc, rc);
 
 	do {
-		rv = vmbus_channel_send_sgl(sc->sc_chan, sgl, 1, &rc->rc_msg,
+		rv = vmbus_channel_send_sgl(rxr->rxr_chan, sgl, 1, &rc->rc_msg,
 		    sizeof(*msg), rc->rc_id);
 		if (rv == EAGAIN) {
 			if (cold)
@@ -1463,7 +1587,7 @@ hvn_rndis_cmd(struct hvn_softc *sc, struct rndis_cmd *rc, int timo)
 		    "RNDIS operation %u send error %d\n", hdr->rm_type, rv);
 		return rv;
 	}
-	if (vmbus_channel_is_revoked(sc->sc_chan)) {
+	if (vmbus_channel_is_revoked(rxr->rxr_chan)) {
 		/* No response */
 		return 0;
 	}
@@ -1475,7 +1599,7 @@ hvn_rndis_cmd(struct hvn_softc *sc, struct rndis_cmd *rc, int timo)
 		if (cold) {
 			delay(1000);
 			s = splnet();
-			hvn_nvs_intr(sc);
+			hvn_nvs_intr(rxr);
 			splx(s);
 		} else
 			tsleep(rc, PRIBIO | PCATCH, "rndiscmd", mstohz(1));
@@ -1501,8 +1625,9 @@ hvn_rndis_cmd(struct hvn_softc *sc, struct rndis_cmd *rc, int timo)
 }
 
 static void
-hvn_rndis_input(struct hvn_softc *sc, uint64_t tid, void *arg)
+hvn_rndis_input(struct hvn_rx_ring *rxr, uint64_t tid, void *arg)
 {
+	struct hvn_softc *sc = rxr->rxr_softc;
 	struct vmbus_chanpkt_prplist *cp = arg;
 	uint32_t off, len, type;
 	int i;
@@ -1523,7 +1648,7 @@ hvn_rndis_input(struct hvn_softc *sc, uint64_t tid, void *arg)
 		switch (type) {
 		/* data message */
 		case REMOTE_NDIS_PACKET_MSG:
-			hvn_rxeof(sc, sc->sc_rx_ring + off, len);
+			hvn_rxeof(rxr, sc->sc_rx_ring + off, len);
 			break;
 		/* completion messages */
 		case REMOTE_NDIS_INITIALIZE_CMPLT:
@@ -1544,7 +1669,7 @@ hvn_rndis_input(struct hvn_softc *sc, uint64_t tid, void *arg)
 		}
 	}
 
-	hvn_nvs_ack(sc, tid);
+	hvn_nvs_ack(rxr, tid);
 }
 
 static inline struct mbuf *
@@ -1577,8 +1702,9 @@ hvn_devget(struct hvn_softc *sc, void *buf, uint32_t len)
 }
 
 static void
-hvn_rxeof(struct hvn_softc *sc, uint8_t *buf, uint32_t len)
+hvn_rxeof(struct hvn_rx_ring *rxr, uint8_t *buf, uint32_t len)
 {
+	struct hvn_softc *sc = rxr->rxr_softc;
 	struct ifnet *ifp = SC2IFP(sc);
 	struct rndis_packet_msg *pkt;
 	struct rndis_pktinfo *pi;
@@ -1687,12 +1813,13 @@ hvn_rndis_complete(struct hvn_softc *sc, uint8_t *buf, uint32_t len)
 }
 
 static int
-hvn_rndis_output(struct hvn_softc *sc, struct hvn_tx_desc *txd)
+hvn_rndis_output(struct hvn_tx_ring *txr, struct hvn_tx_desc *txd)
 {
+	struct hvn_softc *sc = txr->txr_softc;
 	uint64_t rid = (uint64_t)txd->txd_id << 32;
 	int rv;
 
-	rv = vmbus_channel_send_sgl(sc->sc_chan, txd->txd_sgl, txd->txd_nsge,
+	rv = vmbus_channel_send_sgl(txr->txr_chan, txd->txd_sgl, txd->txd_nsge,
 	    &sc->sc_data_msg, sizeof(sc->sc_data_msg), rid);
 	if (rv) {
 		DPRINTF("%s: RNDIS data send error %d\n",
