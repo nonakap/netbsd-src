@@ -38,6 +38,7 @@
 __KERNEL_RCSID(0, "$NetBSD: if_hvn.c,v 1.18 2020/05/24 10:31:59 nonaka Exp $");
 
 #ifdef _KERNEL_OPT
+#include "opt_if_hvn.h"
 #include "opt_inet.h"
 #include "opt_inet6.h"
 #include "opt_net_mpsafe.h"
@@ -53,10 +54,15 @@ __KERNEL_RCSID(0, "$NetBSD: if_hvn.c,v 1.18 2020/05/24 10:31:59 nonaka Exp $");
 #include <sys/intr.h>
 #include <sys/kmem.h>
 #include <sys/mutex.h>
+#include <sys/sysctl.h>
 
 #include <net/if.h>
 #include <net/if_ether.h>
 #include <net/if_media.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/udp.h>
 
 #include <net/bpf.h>
 
@@ -102,6 +108,18 @@ TAILQ_HEAD(rndis_queue, rndis_cmd);
 
 #define HVN_RNDIS_XFER_SIZE		2048
 
+#define HVN_NDIS_TXCSUM_CAP_IP4 \
+	(NDIS_TXCSUM_CAP_IP4 | NDIS_TXCSUM_CAP_IP4OPT)
+#define HVN_NDIS_TXCSUM_CAP_TCP4 \
+	(NDIS_TXCSUM_CAP_TCP4 | NDIS_TXCSUM_CAP_TCP4OPT)
+#define HVN_NDIS_TXCSUM_CAP_TCP6 \
+	(NDIS_TXCSUM_CAP_TCP6 | NDIS_TXCSUM_CAP_TCP6OPT | \
+	    NDIS_TXCSUM_CAP_IP6EXT)
+#define HVN_NDIS_TXCSUM_CAP_UDP6 \
+	(NDIS_TXCSUM_CAP_UDP6 | NDIS_TXCSUM_CAP_IP6EXT)
+#define HVN_NDIS_LSOV2_CAP_IP6 \
+	(NDIS_LSOV2_CAP_IP6EXT | NDIS_LSOV2_CAP_TCP6OPT)
+
 /*
  * Tx ring
  */
@@ -132,6 +150,12 @@ struct hvn_tx_ring {
 	struct hvn_softc		*txr_softc;
 	struct vmbus_channel		*txr_chan;
 
+	int				txr_id;
+	int				txr_csum_assist;
+	uint64_t			txr_caps_assist;
+	uint32_t			txr_flags;
+#define HVN_TXR_FLAG_UDP_HASH		__BIT(0)
+
 	uint32_t			txr_avail;
 	kmutex_t			txr_list_lock;
 	kcondvar_t			txr_list_cv;
@@ -145,6 +169,9 @@ struct hvn_rx_ring {
 	struct hvn_softc		*rxr_softc;
 	struct vmbus_channel		*rxr_chan;
 	struct hvn_tx_ring		*rxr_txr;
+
+	uint32_t			rxr_flags;
+#define HVN_RXR_FLAG_UDP_HASH		__BIT(0)
 
 	/* NVS */
 	uint8_t				*rxr_nvsbuf;
@@ -163,6 +190,19 @@ struct hvn_softc {
 	struct if_percpuq		*sc_ipq;
 	int				sc_link_state;
 	int				sc_promisc;
+ 
+	uint32_t			sc_caps;
+#define	HVN_CAPS_VLAN			__BIT(0)
+#define	HVN_CAPS_MTU			__BIT(1)
+#define	HVN_CAPS_IPCS			__BIT(2)
+#define	HVN_CAPS_TCP4CS			__BIT(3)
+#define	HVN_CAPS_TCP6CS			__BIT(4)
+#define	HVN_CAPS_UDP4CS			__BIT(5)
+#define	HVN_CAPS_UDP6CS			__BIT(6)
+#define	HVN_CAPS_TSO4			__BIT(7)
+#define	HVN_CAPS_TSO6			__BIT(8)
+#define	HVN_CAPS_HASHVAL		__BIT(9)
+#define	HVN_CAPS_UDPHASH		__BIT(10)
 
 	uint32_t			sc_flags;
 #define	HVN_SCF_ATTACHED		__BIT(0)
@@ -178,6 +218,8 @@ struct hvn_softc {
 	/* RNDIS protocol */
 	int				sc_ndisver;
 	uint32_t			sc_rndisrid;
+	int				sc_tso_szmax;
+	int				sc_tso_sgmin;
 	struct rndis_queue		sc_cntl_sq; /* submission queue */
 	kmutex_t			sc_cntl_sqlck;
 	struct rndis_queue		sc_cntl_cq; /* completion queue */
@@ -203,6 +245,16 @@ struct hvn_softc {
 #define SC2IFP(_sc_)	(&(_sc_)->sc_ec.ec_if)
 #define IFP2SC(_ifp_)	((_ifp_)->if_softc)
 
+/*
+ * See hvn_set_hlen().
+ *
+ * This value is for Azure.  For Hyper-V, set this above
+ * 65536 to disable UDP datagram checksum fixup.
+ */
+#ifndef HVN_UDP_CSUM_FIXUP_MTU
+#define HVN_UDP_CSUM_FIXUP_MTU	1420
+#endif
+static int hvn_udpcs_fixup_mtu = HVN_UDP_CSUM_FIXUP_MTU;
 
 static int	hvn_match(device_t, cfdata_t, void *);
 static void	hvn_attach(device_t, device_t, void *);
@@ -218,26 +270,31 @@ static int	hvn_iff(struct hvn_softc *);
 static int	hvn_init(struct ifnet *);
 static void	hvn_stop(struct ifnet *, int);
 static void	hvn_start(struct ifnet *);
-static int	hvn_encap(struct hvn_tx_ring *, struct mbuf *,
+static int	hvn_encap(struct hvn_tx_ring *, struct mbuf *, int,
 		    struct hvn_tx_desc **);
 static void	hvn_decap(struct hvn_tx_ring *, struct hvn_tx_desc *);
 static void	hvn_txeof(struct hvn_tx_ring *, uint64_t);
 static int	hvn_rx_ring_create(struct hvn_softc *, int);
 static int	hvn_rx_ring_destroy(struct hvn_softc *);
+static void	hvn_fixup_rx_data(struct hvn_softc *);
 static int	hvn_tx_ring_create(struct hvn_softc *, int);
 static void	hvn_tx_ring_destroy(struct hvn_softc *);
+static void	hvn_fixup_tx_data(struct hvn_softc *);
+static struct mbuf *
+		hvn_set_hlen(struct mbuf *, int *);
 static int	hvn_txd_peek(struct hvn_tx_ring *);
 static struct hvn_tx_desc *
 		hvn_txd_get(struct hvn_tx_ring *);
 static void	hvn_txd_put(struct hvn_tx_ring *, struct hvn_tx_desc *);
-static int	hvn_set_capabilities(struct hvn_softc *);
+static int	hvn_get_hwcaps(struct hvn_softc *, struct ndis_offload *);
+static int	hvn_set_capabilities(struct hvn_softc *, int);
 static int	hvn_get_lladdr(struct hvn_softc *, uint8_t *);
 static void	hvn_get_link_status(struct hvn_softc *);
 static int	hvn_channel_attach(struct hvn_softc *, struct vmbus_channel *);
 static void	hvn_channel_detach(struct hvn_softc *, struct vmbus_channel *);
 
 /* NSVP */
-static int	hvn_nvs_attach(struct hvn_softc *);
+static int	hvn_nvs_attach(struct hvn_softc *, int);
 static int	hvn_nvs_connect_rxbuf(struct hvn_softc *);
 static int	hvn_nvs_disconnect_rxbuf(struct hvn_softc *);
 static void	hvn_nvs_intr(void *);
@@ -246,7 +303,7 @@ static int	hvn_nvs_ack(struct hvn_rx_ring *, uint64_t);
 static void	hvn_nvs_detach(struct hvn_softc *);
 
 /* RNDIS */
-static int	hvn_rndis_attach(struct hvn_softc *);
+static int	hvn_rndis_attach(struct hvn_softc *, int);
 static int	hvn_rndis_cmd(struct hvn_softc *, struct rndis_cmd *, int);
 static void	hvn_rndis_input(struct hvn_rx_ring *, uint64_t, void *);
 static void	hvn_rxeof(struct hvn_rx_ring *, uint8_t *, uint32_t);
@@ -254,6 +311,8 @@ static void	hvn_rndis_complete(struct hvn_softc *, uint8_t *, uint32_t);
 static int	hvn_rndis_output(struct hvn_tx_ring *, struct hvn_tx_desc *);
 static void	hvn_rndis_status(struct hvn_softc *, uint8_t *, uint32_t);
 static int	hvn_rndis_query(struct hvn_softc *, uint32_t, void *, size_t *);
+static int	hvn_rndis_query2(struct hvn_softc *, uint32_t, const void *,
+		    size_t, void *, size_t *, size_t);
 static int	hvn_rndis_set(struct hvn_softc *, uint32_t, void *, size_t);
 static int	hvn_rndis_open(struct hvn_softc *);
 static int	hvn_rndis_close(struct hvn_softc *);
@@ -303,7 +362,7 @@ hvn_attach(device_t parent, device_t self, void *aux)
 		goto destroy_rx_ring;
 	}
 
-	if (hvn_nvs_attach(sc)) {
+	if (hvn_nvs_attach(sc, ETHERMTU)) {
 		aprint_error_dev(self, "failed to init NVSP\n");
 		goto detach_prichan;
 	}
@@ -315,20 +374,6 @@ hvn_attach(device_t parent, device_t self, void *aux)
 	ifp->if_start = hvn_start;
 	ifp->if_init = hvn_init;
 	ifp->if_stop = hvn_stop;
-	ifp->if_capabilities = IFCAP_CSUM_IPv4_Tx | IFCAP_CSUM_IPv4_Rx;
-	ifp->if_capabilities |= IFCAP_CSUM_TCPv4_Tx | IFCAP_CSUM_TCPv4_Rx;
-	ifp->if_capabilities |= IFCAP_CSUM_TCPv6_Tx | IFCAP_CSUM_TCPv6_Rx;
-	if (sc->sc_ndisver > NDIS_VERSION_6_30) {
-		ifp->if_capabilities |= IFCAP_CSUM_UDPv4_Tx;
-		ifp->if_capabilities |= IFCAP_CSUM_UDPv4_Rx;
-		ifp->if_capabilities |= IFCAP_CSUM_UDPv6_Tx;
-		ifp->if_capabilities |= IFCAP_CSUM_UDPv6_Rx;
-	}
-	if (sc->sc_proto >= HVN_NVS_PROTO_VERSION_2) {
-		sc->sc_ec.ec_capabilities |= ETHERCAP_VLAN_HWTAGGING;
-		sc->sc_ec.ec_capabilities |= ETHERCAP_VLAN_MTU;
-		sc->sc_ec.ec_capenable |= ETHERCAP_VLAN_HWTAGGING;
-	}
 
 	IFQ_SET_MAXLEN(&ifp->if_snd, HVN_TX_DESC - 1);
 	IFQ_SET_READY(&ifp->if_snd);
@@ -350,7 +395,7 @@ hvn_attach(device_t parent, device_t self, void *aux)
 	sc->sc_ipq = if_percpuq_create(ifp);
 	if_deferred_start_init(ifp, NULL);
 
-	if (hvn_rndis_attach(sc)) {
+	if (hvn_rndis_attach(sc, ETHERMTU)) {
 		aprint_error_dev(self, "failed to init RNDIS\n");
 		goto destroy_if_percpuq;
 	}
@@ -359,7 +404,7 @@ hvn_attach(device_t parent, device_t self, void *aux)
 	    sc->sc_proto >> 16, sc->sc_proto & 0xffff,
 	    sc->sc_ndisver >> 16 , sc->sc_ndisver & 0xffff);
 
-	if (hvn_set_capabilities(sc)) {
+	if (hvn_set_capabilities(sc, ETHERMTU)) {
 		aprint_error_dev(self, "failed to setup offloading\n");
 		goto detach_rndis;
 	}
@@ -370,6 +415,25 @@ hvn_attach(device_t parent, device_t self, void *aux)
 		goto detach_rndis;
 	}
 	aprint_normal_dev(self, "Ethernet address %s\n", ether_sprintf(enaddr));
+
+	/*
+	 * Fixup TX/RX stuffs after synthetic parts are attached.
+	 */
+	hvn_fixup_tx_data(sc);
+	hvn_fixup_rx_data(sc);
+
+	ifp->if_capabilities |= sc->sc_txr[0].txr_caps_assist &
+		(IFCAP_CSUM_IPv4_Tx | IFCAP_CSUM_IPv4_Rx |
+		 IFCAP_CSUM_TCPv4_Tx | IFCAP_CSUM_TCPv4_Rx |
+		 IFCAP_CSUM_TCPv6_Tx | IFCAP_CSUM_TCPv6_Rx |
+		 IFCAP_CSUM_UDPv4_Tx | IFCAP_CSUM_UDPv4_Rx |
+		 IFCAP_CSUM_UDPv6_Tx | IFCAP_CSUM_UDPv6_Rx);
+	/* XXX TSOv4, TSOv6 */
+	if (sc->sc_caps & HVN_CAPS_VLAN) {
+		/* XXX not sure about VLAN_MTU. */
+		sc->sc_ec.ec_capabilities |= ETHERCAP_VLAN_HWTAGGING;
+		sc->sc_ec.ec_capabilities |= ETHERCAP_VLAN_MTU;
+	}
 
 	ether_ifattach(ifp, enaddr);
 	if_register(ifp);
@@ -535,6 +599,7 @@ hvn_start(struct ifnet *ifp)
 	struct hvn_tx_ring *txr = &sc->sc_txr[0];
 	struct hvn_tx_desc *txd;
 	struct mbuf *m;
+	int l2hlen = ETHER_HDR_LEN;
 
 	if ((ifp->if_flags & (IFF_RUNNING | IFF_OACTIVE)) != IFF_RUNNING)
 		return;
@@ -550,7 +615,18 @@ hvn_start(struct ifnet *ifp)
 		if (m == NULL)
 			break;
 
-		if (hvn_encap(txr, m, &txd)) {
+#if defined(INET) || defined(INET6)
+		if (m->m_pkthdr.csum_flags &
+		    (M_CSUM_TCPv4|M_CSUM_UDPv4|M_CSUM_TCPv6|M_CSUM_UDPv6)) {
+			m = hvn_set_hlen(m, &l2hlen);
+			if (__predict_false(m == NULL)) {
+				if_statinc(ifp, if_oerrors);
+				continue;
+			}
+		}
+#endif
+
+		if (hvn_encap(txr, m, l2hlen, &txd)) {
 			/* the chain is too large */
 			if_statinc(ifp, if_oerrors);
 			m_freem(m);
@@ -591,13 +667,125 @@ hvn_rndis_pktinfo_append(struct rndis_packet_msg *pkt, size_t pktsize,
 	return (char *)pi->rm_data;
 }
 
+static struct mbuf *
+hvn_pullup_hdr(struct mbuf *m, int len)
+{
+	struct mbuf *mn;
+
+	if (__predict_false(m->m_len < len)) {
+		mn = m_pullup(m, len);
+		if (mn == NULL)
+			return NULL;
+		m = mn;
+	}
+	return m;
+}
+
+/*
+ * NOTE: If this function failed, the m would be freed.
+ */
+static struct mbuf *
+hvn_set_hlen(struct mbuf *m, int *l2hlenp)
+{
+	const struct ether_header *eh;
+	int l2hlen, off;
+
+	m = hvn_pullup_hdr(m, sizeof(*eh));
+	if (m == NULL)
+		return NULL;
+
+	eh = mtod(m, const struct ether_header *);
+	switch (ntohs(eh->ether_type)) {
+#if defined(INET) || defined(INET6)
+#if defined(INET)
+	case ETHERTYPE_IP:
+#endif
+#if defined(INET6)
+	case ETHERTYPE_IPV6:
+#endif
+		l2hlen = ETHER_HDR_LEN;
+		break;
+#endif	/* INET || INET6 */
+	case ETHERTYPE_VLAN:
+		l2hlen = ETHER_HDR_LEN + ETHER_VLAN_ENCAP_LEN;
+		break;
+	default:
+		m_freem(m);
+		return NULL;
+	}
+
+#if defined(INET)
+	if (m->m_pkthdr.csum_flags & (M_CSUM_TCPv4 | M_CSUM_UDPv4)) {
+		const struct ip *ip;
+
+		off = l2hlen + sizeof(*ip);
+		m = hvn_pullup_hdr(m, off);
+		if (m == NULL)
+			return NULL;
+
+		ip = (struct ip *)((mtod(m, uint8_t *)) + off);
+
+		/*
+		 * UDP checksum offload does not work in Azure, if the
+		 * following conditions meet:
+		 * - sizeof(IP hdr + UDP hdr + payload) > 1420.
+		 * - IP_DF is not set in the IP hdr.
+		 *
+		 * Fallback to software checksum for these UDP datagrams.
+		 */
+		if ((m->m_pkthdr.csum_flags & M_CSUM_UDPv4) &&
+		    m->m_pkthdr.len > hvn_udpcs_fixup_mtu + l2hlen &&
+		    !(ntohs(ip->ip_off) & IP_DF)) {
+			uint16_t *csump;
+
+			off = l2hlen +
+			    M_CSUM_DATA_IPv4_IPHL(m->m_pkthdr.csum_data);
+			m = hvn_pullup_hdr(m, off + sizeof(struct udphdr));
+			if (m == NULL)
+				return NULL;
+
+			csump = (uint16_t *)(mtod(m, uint8_t *) + off +
+			    M_CSUM_DATA_IPv4_OFFSET(m->m_pkthdr.csum_data));
+			*csump = cpu_in_cksum(m, m->m_pkthdr.len - off, off, 0);
+			m->m_pkthdr.csum_flags &= ~M_CSUM_UDPv4;
+		}
+	}
+#endif	/* INET */
+#if defined(INET) && defined(INET6)
+	else
+#endif	/* INET && INET6 */
+#if defined(INET6)
+	{
+		const struct ip6_hdr *ip6;
+
+		off = l2hlen + sizeof(*ip6);
+		m = hvn_pullup_hdr(m, off);
+		if (m == NULL)
+			return NULL;
+
+		ip6 = (struct ip6_hdr *)((mtod(m, uint8_t *)) + off);
+		if (ip6->ip6_nxt != IPPROTO_TCP &&
+		    ip6->ip6_nxt != IPPROTO_UDP) {
+			m_freem(m);
+			return NULL;
+		}
+	}
+#endif	/* INET6 */
+
+	*l2hlenp = l2hlen;
+
+	return m;
+}
+
 static int
-hvn_encap(struct hvn_tx_ring *txr, struct mbuf *m, struct hvn_tx_desc **txd0)
+hvn_encap(struct hvn_tx_ring *txr, struct mbuf *m, int l2hlen,
+    struct hvn_tx_desc **txd0)
 {
 	struct hvn_softc *sc = txr->txr_softc;
 	struct hvn_tx_desc *txd;
 	struct rndis_packet_msg *pkt;
 	bus_dma_segment_t *seg;
+	char *cp;
 	size_t pktlen;
 	int i, rv;
 
@@ -628,9 +816,19 @@ hvn_encap(struct hvn_tx_ring *txr, struct mbuf *m, struct hvn_tx_desc **txd0)
 	}
 	txd->txd_buf = m;
 
+	if (txr->txr_flags & HVN_TXR_FLAG_UDP_HASH) {
+		/*
+		 * Set the hash value for this packet, so that the host could
+		 * dispatch the TX done event for this packet back to this TX
+		 * ring's channel.
+		 */
+		cp = hvn_rndis_pktinfo_append(pkt, HVN_RNDIS_PKT_LEN,
+		    HVN_NDIS_HASH_VALUE_SIZE, HVN_NDIS_PKTINFO_TYPE_HASHVAL);
+		memcpy(cp, &txr->txr_id, HVN_NDIS_HASH_VALUE_SIZE);
+	}
+
 	if (vlan_has_tag(m)) {
 		uint32_t vlan;
-		char *cp;
 		uint16_t tag;
 
 		tag = vlan_get_tag(m);
@@ -641,17 +839,32 @@ hvn_encap(struct hvn_tx_ring *txr, struct mbuf *m, struct hvn_tx_desc **txd0)
 		memcpy(cp, &vlan, NDIS_VLAN_INFO_SIZE);
 	}
 
-	if (m->m_pkthdr.csum_flags & (M_CSUM_IPv4 | M_CSUM_UDPv4 |
-	    M_CSUM_TCPv4)) {
-		uint32_t csum = NDIS_TXCSUM_INFO_IPV4;
-		char *cp;
+	if (m->m_pkthdr.csum_flags & txr->txr_csum_assist) {
+		uint32_t csum;
 
-		if (m->m_pkthdr.csum_flags & M_CSUM_IPv4)
-			csum |= NDIS_TXCSUM_INFO_IPCS;
-		if (m->m_pkthdr.csum_flags & M_CSUM_TCPv4)
-			csum |= NDIS_TXCSUM_INFO_TCPCS;
-		if (m->m_pkthdr.csum_flags & M_CSUM_UDPv4)
-			csum |= NDIS_TXCSUM_INFO_UDPCS;
+		if (m->m_pkthdr.csum_flags & (M_CSUM_TCPv6|M_CSUM_UDPv6)) {
+			csum = NDIS_TXCSUM_INFO_IPV6;
+			if (m->m_pkthdr.csum_flags & M_CSUM_TCPv6)
+				csum |= NDIS_TXCSUM_INFO_MKTCPCS(l2hlen +
+				    M_CSUM_DATA_IPv6_IPHL(
+				        m->m_pkthdr.csum_data));
+			if (m->m_pkthdr.csum_flags & M_CSUM_UDPv6)
+				csum |= NDIS_TXCSUM_INFO_MKUDPCS(l2hlen +
+				      M_CSUM_DATA_IPv6_IPHL(
+				        m->m_pkthdr.csum_data));
+		} else {
+			csum = NDIS_TXCSUM_INFO_IPV4;
+			if (m->m_pkthdr.csum_flags & M_CSUM_IPv4)
+				csum |= NDIS_TXCSUM_INFO_IPCS;
+			if (m->m_pkthdr.csum_flags & M_CSUM_TCPv4)
+				csum |= NDIS_TXCSUM_INFO_MKTCPCS(l2hlen +
+				      M_CSUM_DATA_IPv4_IPHL(
+				        m->m_pkthdr.csum_data));
+			if (m->m_pkthdr.csum_flags & M_CSUM_UDPv4)
+				csum |= NDIS_TXCSUM_INFO_MKUDPCS(l2hlen +
+				      M_CSUM_DATA_IPv4_IPHL(
+				        m->m_pkthdr.csum_data));
+		}
 		cp = hvn_rndis_pktinfo_append(pkt, HVN_RNDIS_PKT_LEN,
 		    NDIS_TXCSUM_INFO_SIZE, NDIS_PKTINFO_TYPE_CSUM);
 		memcpy(cp, &csum, NDIS_TXCSUM_INFO_SIZE);
@@ -800,6 +1013,20 @@ hvn_rx_ring_destroy(struct hvn_softc *sc)
 	return 0;
 }
 
+static void
+hvn_fixup_rx_data(struct hvn_softc *sc)
+{
+	struct hvn_rx_ring *rxr;
+	int i;
+
+	if (sc->sc_caps & HVN_CAPS_UDPHASH) {
+		for (i = 0; i < sc->sc_nrxr; i++) {
+			rxr = &sc->sc_rxr[i];
+			rxr->rxr_flags |= HVN_RXR_FLAG_UDP_HASH;
+		}
+	}
+}
+
 static int
 hvn_tx_ring_create(struct hvn_softc *sc, int ring_cnt)
 {
@@ -818,6 +1045,7 @@ hvn_tx_ring_create(struct hvn_softc *sc, int ring_cnt)
 	for (j = 0; j < ring_cnt; j++) {
 		txr = &sc->sc_txr[j];
 		txr->txr_softc = sc;
+		txr->txr_id = j;
 
 		mutex_init(&txr->txr_list_lock, MUTEX_DEFAULT, IPL_NET);
 		cv_init(&txr->txr_list_cv, "hvntxdcv");
@@ -895,6 +1123,55 @@ hvn_tx_ring_destroy(struct hvn_softc *sc)
 
 	kmem_free(sc->sc_txr, sizeof(*txr) * sc->sc_ntxr);
 	sc->sc_txr = NULL;
+}
+
+static void
+hvn_fixup_tx_data(struct hvn_softc *sc)
+{
+	struct hvn_tx_ring *txr;
+	uint64_t caps_assist;
+	int csum_assist;
+	int i;
+
+	caps_assist = 0;
+	csum_assist = 0;
+	if (sc->sc_caps & HVN_CAPS_IPCS) {
+		caps_assist |= IFCAP_CSUM_IPv4_Tx;
+		caps_assist |= IFCAP_CSUM_IPv4_Rx;
+		csum_assist |= M_CSUM_IPv4;
+	}
+	if (sc->sc_caps & HVN_CAPS_TCP4CS) {
+		caps_assist |= IFCAP_CSUM_TCPv4_Tx;
+		caps_assist |= IFCAP_CSUM_TCPv4_Rx;
+		csum_assist |= M_CSUM_TCPv4;
+	}
+	if (sc->sc_caps &  HVN_CAPS_TCP6CS) {
+		caps_assist |= IFCAP_CSUM_TCPv6_Tx;
+		caps_assist |= IFCAP_CSUM_TCPv6_Rx;
+		csum_assist |= M_CSUM_TCPv6;
+	}
+	if (sc->sc_caps & HVN_CAPS_UDP4CS) {
+		caps_assist |= IFCAP_CSUM_UDPv4_Tx;
+		caps_assist |= IFCAP_CSUM_UDPv4_Rx;
+		csum_assist |= M_CSUM_UDPv4;
+	}
+	if (sc->sc_caps & HVN_CAPS_UDP6CS) {
+		caps_assist |= IFCAP_CSUM_UDPv6_Tx;
+		caps_assist |= IFCAP_CSUM_UDPv6_Rx;
+		csum_assist |= M_CSUM_UDPv6;
+	}
+	for (i = 0; i < sc->sc_ntxr; i++) {
+		txr = &sc->sc_txr[i];
+		txr->txr_caps_assist = caps_assist;
+		txr->txr_csum_assist = csum_assist;
+	}
+
+	if (sc->sc_caps & HVN_CAPS_UDPHASH) {
+		for (i = 0; i < sc->sc_ntxr; i++) {
+			txr = &sc->sc_txr[i];
+			txr->txr_flags |= HVN_TXR_FLAG_UDP_HASH;
+		}
+	}
 }
 
 static int
@@ -1010,7 +1287,7 @@ hvn_channel_detach(struct hvn_softc *sc, struct vmbus_channel *chan)
 }
 
 static int
-hvn_nvs_attach(struct hvn_softc *sc)
+hvn_nvs_attach(struct hvn_softc *sc, int mtu)
 {
 	static const uint32_t protos[] = {
 		HVN_NVS_PROTO_VERSION_5,
@@ -1025,6 +1302,9 @@ hvn_nvs_attach(struct hvn_softc *sc)
 	uint32_t ndisver;
 	uint64_t tid;
 	int i;
+
+	if (hyperv_ver_major >= 10)
+		sc->sc_caps |= HVN_CAPS_UDPHASH;
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.nvs_type = HVN_NVS_TYPE_INIT;
@@ -1046,15 +1326,20 @@ hvn_nvs_attach(struct hvn_softc *sc)
 		return -1;
 	}
 
+	if (sc->sc_proto >= HVN_NVS_PROTO_VERSION_5)
+		sc->sc_caps |= HVN_CAPS_HASHVAL;
+
 	if (sc->sc_proto >= HVN_NVS_PROTO_VERSION_2) {
 		memset(&ccmd, 0, sizeof(ccmd));
 		ccmd.nvs_type = HVN_NVS_TYPE_NDIS_CONF;
-		ccmd.nvs_mtu = HVN_MAXMTU;
+		ccmd.nvs_mtu = mtu + ETHER_HDR_LEN;
 		ccmd.nvs_caps = HVN_NVS_NDIS_CONF_VLAN;
 
 		tid = atomic_inc_uint_nv(&sc->sc_nvstid);
 		if (hvn_nvs_cmd(sc, &ccmd, sizeof(ccmd), tid, 100))
 			return -1;
+
+		sc->sc_caps |= HVN_CAPS_MTU | HVN_CAPS_VLAN;
 	}
 
 	memset(&ncmd, 0, sizeof(ncmd));
@@ -1403,7 +1688,7 @@ hvn_free_cmd(struct hvn_softc *sc, struct rndis_cmd *rc)
 }
 
 static int
-hvn_rndis_attach(struct hvn_softc *sc)
+hvn_rndis_attach(struct hvn_softc *sc, int mtu)
 {
 	const int dmaflags = cold ? BUS_DMA_NOWAIT : BUS_DMA_WAITOK;
 	struct rndis_init_req *req;
@@ -1515,11 +1800,98 @@ errout:
 }
 
 static int
-hvn_set_capabilities(struct hvn_softc *sc)
+hvn_get_hwcaps(struct hvn_softc *sc, struct ndis_offload *caps)
 {
-	struct ndis_offload_params params;
-	size_t len = sizeof(params);
+	struct ndis_offload in;
+	size_t caps_len, len;
+	int error;
 
+	memset(&in, 0, sizeof(in));
+	in.ndis_hdr.ndis_type = NDIS_OBJTYPE_OFFLOAD;
+	if (sc->sc_ndisver >= NDIS_VERSION_6_30) {
+		in.ndis_hdr.ndis_rev = NDIS_OFFLOAD_REV_3;
+		len = in.ndis_hdr.ndis_size = NDIS_OFFLOAD_SIZE;
+	} else if (sc->sc_ndisver >= NDIS_VERSION_6_1) {
+		in.ndis_hdr.ndis_rev = NDIS_OFFLOAD_REV_2;
+		len = in.ndis_hdr.ndis_size = NDIS_OFFLOAD_SIZE_6_1;
+	} else {
+		in.ndis_hdr.ndis_rev = NDIS_OFFLOAD_REV_1;
+		len = in.ndis_hdr.ndis_size = NDIS_OFFLOAD_SIZE_6_0;
+	}
+
+	caps_len = NDIS_OFFLOAD_SIZE;
+	error = hvn_rndis_query2(sc, OID_TCP_OFFLOAD_HARDWARE_CAPABILITIES,
+	    &in, len, caps, &caps_len, NDIS_OFFLOAD_SIZE_6_0);
+	if (error)
+		return error;
+
+	/*
+	 * Preliminary verification.
+	 */
+	if (caps->ndis_hdr.ndis_type != NDIS_OBJTYPE_OFFLOAD) {
+		DPRINTF("%s: invalid NDIS objtype 0x%02x\n",
+		    device_xname(sc->sc_dev), caps->ndis_hdr.ndis_type);
+		return EINVAL;
+	}
+	if (caps->ndis_hdr.ndis_rev < NDIS_OFFLOAD_REV_1) {
+		DPRINTF("%s: invalid NDIS objrev 0x%02x\n",
+		    device_xname(sc->sc_dev), caps->ndis_hdr.ndis_rev);
+		return EINVAL;
+	}
+	if (caps->ndis_hdr.ndis_size > caps_len) {
+		DPRINTF("%s: invalid NDIS objsize %u, data size %zu\n",
+		    device_xname(sc->sc_dev), caps->ndis_hdr.ndis_size,
+		    caps_len);
+		return EINVAL;
+	} else if (caps->ndis_hdr.ndis_size < NDIS_OFFLOAD_SIZE_6_0) {
+		DPRINTF("%s: invalid NDIS objsize %u\n",
+		    device_xname(sc->sc_dev), caps->ndis_hdr.ndis_size);
+		return EINVAL;
+	}
+
+	/*
+	 * NOTE:
+	 * caps->ndis_hdr.ndis_size MUST be checked before accessing
+	 * NDIS 6.1+ specific fields.
+	 */
+	aprint_debug_dev(sc->sc_dev, "hwcaps rev %u\n",
+	    caps->ndis_hdr.ndis_rev);
+
+	aprint_debug_dev(sc->sc_dev, "hwcaps csum: "
+	    "ip4 tx 0x%x/0x%x rx 0x%x/0x%x, "
+	    "ip6 tx 0x%x/0x%x rx 0x%x/0x%x\n",
+	    caps->ndis_csum.ndis_ip4_txcsum, caps->ndis_csum.ndis_ip4_txenc,
+	    caps->ndis_csum.ndis_ip4_rxcsum, caps->ndis_csum.ndis_ip4_rxenc,
+	    caps->ndis_csum.ndis_ip6_txcsum, caps->ndis_csum.ndis_ip6_txenc,
+	    caps->ndis_csum.ndis_ip6_rxcsum, caps->ndis_csum.ndis_ip6_rxenc);
+	aprint_debug_dev(sc->sc_dev, "hwcaps lsov2: "
+	    "ip4 maxsz %u minsg %u encap 0x%x, "
+	    "ip6 maxsz %u minsg %u encap 0x%x opts 0x%x\n",
+	    caps->ndis_lsov2.ndis_ip4_maxsz, caps->ndis_lsov2.ndis_ip4_minsg,
+	    caps->ndis_lsov2.ndis_ip4_encap, caps->ndis_lsov2.ndis_ip6_maxsz,
+	    caps->ndis_lsov2.ndis_ip6_minsg, caps->ndis_lsov2.ndis_ip6_encap,
+	    caps->ndis_lsov2.ndis_ip6_opts);
+
+	return 0;
+}
+
+static int
+hvn_set_capabilities(struct hvn_softc *sc, int mtu)
+{
+	struct ndis_offload hwcaps;
+	struct ndis_offload_params params;
+	size_t len;
+	uint32_t caps = 0;
+	int error, tso_maxsz, tso_minsg;
+
+	error = hvn_get_hwcaps(sc, &hwcaps);
+	if (error) {
+		DPRINTF("%s: failed to query hwcaps\n",
+		    device_xname(sc->sc_dev));
+		return error;
+	}
+
+	/* NOTE: 0 means "no change" */
 	memset(&params, 0, sizeof(params));
 
 	params.ndis_hdr.ndis_type = NDIS_OBJTYPE_DEFAULT;
@@ -1531,15 +1903,137 @@ hvn_set_capabilities(struct hvn_softc *sc)
 		len = params.ndis_hdr.ndis_size = NDIS_OFFLOAD_PARAMS_SIZE;
 	}
 
-	params.ndis_ip4csum = NDIS_OFFLOAD_PARAM_TXRX;
-	params.ndis_tcp4csum = NDIS_OFFLOAD_PARAM_TXRX;
-	params.ndis_tcp6csum = NDIS_OFFLOAD_PARAM_TXRX;
-	if (sc->sc_ndisver >= NDIS_VERSION_6_30) {
-		params.ndis_udp4csum = NDIS_OFFLOAD_PARAM_TXRX;
-		params.ndis_udp6csum = NDIS_OFFLOAD_PARAM_TXRX;
+	/*
+	 * TSO4/TSO6 setup.
+	 */
+	tso_maxsz = IP_MAXPACKET;
+	tso_minsg = 2;
+	if (hwcaps.ndis_lsov2.ndis_ip4_encap & NDIS_OFFLOAD_ENCAP_8023) {
+		caps |= HVN_CAPS_TSO4;
+		params.ndis_lsov2_ip4 = NDIS_OFFLOAD_LSOV2_ON;
+
+		if (hwcaps.ndis_lsov2.ndis_ip4_maxsz < tso_maxsz)
+			tso_maxsz = hwcaps.ndis_lsov2.ndis_ip4_maxsz;
+		if (hwcaps.ndis_lsov2.ndis_ip4_minsg > tso_minsg)
+			tso_minsg = hwcaps.ndis_lsov2.ndis_ip4_minsg;
+	}
+	if ((hwcaps.ndis_lsov2.ndis_ip6_encap & NDIS_OFFLOAD_ENCAP_8023) &&
+	    (hwcaps.ndis_lsov2.ndis_ip6_opts & HVN_NDIS_LSOV2_CAP_IP6) ==
+	    HVN_NDIS_LSOV2_CAP_IP6) {
+		caps |= HVN_CAPS_TSO6;
+		params.ndis_lsov2_ip6 = NDIS_OFFLOAD_LSOV2_ON;
+
+		if (hwcaps.ndis_lsov2.ndis_ip6_maxsz < tso_maxsz)
+			tso_maxsz = hwcaps.ndis_lsov2.ndis_ip6_maxsz;
+		if (hwcaps.ndis_lsov2.ndis_ip6_minsg > tso_minsg)
+			tso_minsg = hwcaps.ndis_lsov2.ndis_ip6_minsg;
+	}
+	sc->sc_tso_szmax = 0;
+	sc->sc_tso_sgmin = 0;
+	if (caps & (HVN_CAPS_TSO4 | HVN_CAPS_TSO6)) {
+		KASSERTMSG(tso_maxsz <= IP_MAXPACKET,
+		    "invalid NDIS TSO maxsz %d", tso_maxsz);
+		KASSERTMSG(tso_minsg >= 2,
+		    "invalid NDIS TSO minsg %d", tso_minsg);
+		if (tso_maxsz < tso_minsg * mtu) {
+			DPRINTF("%s: invalid NDIS TSO config: "
+			    "maxsz %d, minsg %d, mtu %d; "
+			    "disable TSO4 and TSO6\n", device_xname(sc->sc_dev),
+			    tso_maxsz, tso_minsg, mtu);
+			caps &= ~(HVN_CAPS_TSO4 | HVN_CAPS_TSO6);
+			params.ndis_lsov2_ip4 = NDIS_OFFLOAD_LSOV2_OFF;
+			params.ndis_lsov2_ip6 = NDIS_OFFLOAD_LSOV2_OFF;
+		} else {
+			sc->sc_tso_szmax = tso_maxsz;
+			sc->sc_tso_sgmin = tso_minsg;
+			aprint_debug_dev(sc->sc_dev,
+			    "NDIS TSO szmax %d sgmin %d\n",
+			    sc->sc_tso_szmax, sc->sc_tso_sgmin);
+		}
 	}
 
-	return hvn_rndis_set(sc, OID_TCP_OFFLOAD_PARAMETERS, &params, len);
+	/* IPv4 checksum */
+	if ((hwcaps.ndis_csum.ndis_ip4_txcsum & HVN_NDIS_TXCSUM_CAP_IP4) ==
+	    HVN_NDIS_TXCSUM_CAP_IP4) {
+		caps |= HVN_CAPS_IPCS;
+		params.ndis_ip4csum = NDIS_OFFLOAD_PARAM_TX;
+	}
+	if (hwcaps.ndis_csum.ndis_ip4_rxcsum & NDIS_RXCSUM_CAP_IP4) {
+		if (params.ndis_ip4csum == NDIS_OFFLOAD_PARAM_TX)
+			params.ndis_ip4csum = NDIS_OFFLOAD_PARAM_TXRX;
+		else
+			params.ndis_ip4csum = NDIS_OFFLOAD_PARAM_RX;
+	}
+
+	/* TCP4 checksum */
+	if ((hwcaps.ndis_csum.ndis_ip4_txcsum & HVN_NDIS_TXCSUM_CAP_TCP4) ==
+	    HVN_NDIS_TXCSUM_CAP_TCP4) {
+		caps |= HVN_CAPS_TCP4CS;
+		params.ndis_tcp4csum = NDIS_OFFLOAD_PARAM_TX;
+	}
+	if (hwcaps.ndis_csum.ndis_ip4_rxcsum & NDIS_RXCSUM_CAP_TCP4) {
+		if (params.ndis_tcp4csum == NDIS_OFFLOAD_PARAM_TX)
+			params.ndis_tcp4csum = NDIS_OFFLOAD_PARAM_TXRX;
+		else
+			params.ndis_tcp4csum = NDIS_OFFLOAD_PARAM_RX;
+	}
+
+	/* UDP4 checksum */
+	if (hwcaps.ndis_csum.ndis_ip4_txcsum & NDIS_TXCSUM_CAP_UDP4) {
+		caps |= HVN_CAPS_UDP4CS;
+		params.ndis_udp4csum = NDIS_OFFLOAD_PARAM_TX;
+	}
+	if (hwcaps.ndis_csum.ndis_ip4_rxcsum & NDIS_RXCSUM_CAP_UDP4) {
+		if (params.ndis_udp4csum == NDIS_OFFLOAD_PARAM_TX)
+			params.ndis_udp4csum = NDIS_OFFLOAD_PARAM_TXRX;
+		else
+			params.ndis_udp4csum = NDIS_OFFLOAD_PARAM_RX;
+	}
+
+	/* TCP6 checksum */
+	if ((hwcaps.ndis_csum.ndis_ip6_txcsum & HVN_NDIS_TXCSUM_CAP_TCP6) ==
+	    HVN_NDIS_TXCSUM_CAP_TCP6) {
+		caps |= HVN_CAPS_TCP6CS;
+		params.ndis_tcp6csum = NDIS_OFFLOAD_PARAM_TX;
+	}
+	if (hwcaps.ndis_csum.ndis_ip6_rxcsum & NDIS_RXCSUM_CAP_TCP6) {
+		if (params.ndis_tcp6csum == NDIS_OFFLOAD_PARAM_TX)
+			params.ndis_tcp6csum = NDIS_OFFLOAD_PARAM_TXRX;
+		else
+			params.ndis_tcp6csum = NDIS_OFFLOAD_PARAM_RX;
+	}
+
+	/* UDP6 checksum */
+	if ((hwcaps.ndis_csum.ndis_ip6_txcsum & HVN_NDIS_TXCSUM_CAP_UDP6) ==
+	    HVN_NDIS_TXCSUM_CAP_UDP6) {
+		caps |= HVN_CAPS_UDP6CS;
+		params.ndis_udp6csum = NDIS_OFFLOAD_PARAM_TX;
+	}
+	if (hwcaps.ndis_csum.ndis_ip6_rxcsum & NDIS_RXCSUM_CAP_UDP6) {
+		if (params.ndis_udp6csum == NDIS_OFFLOAD_PARAM_TX)
+			params.ndis_udp6csum = NDIS_OFFLOAD_PARAM_TXRX;
+		else
+			params.ndis_udp6csum = NDIS_OFFLOAD_PARAM_RX;
+	}
+
+	aprint_debug_dev(sc->sc_dev, "offload csum: "
+	    "ip4 %u, tcp4 %u, udp4 %u, tcp6 %u, udp6 %u\n",
+	    params.ndis_ip4csum, params.ndis_tcp4csum, params.ndis_udp4csum,
+	    params.ndis_tcp6csum, params.ndis_udp6csum);
+	aprint_debug_dev(sc->sc_dev, "offload lsov2: ip4 %u, ip6 %u\n",
+	    params.ndis_lsov2_ip4, params.ndis_lsov2_ip6);
+
+	error = hvn_rndis_set(sc, OID_TCP_OFFLOAD_PARAMETERS, &params, len);
+	if (error) {
+		DPRINTF("%s: offload config failed: %d\n",
+		    device_xname(sc->sc_dev), error);
+		return error;
+	}
+
+	aprint_debug_dev(sc->sc_dev, "offload config done\n");
+	sc->sc_caps |= caps;
+
+	return 0;
 }
 
 static int
@@ -1770,6 +2264,10 @@ hvn_rxeof(struct hvn_rx_ring *rxr, uint8_t *buf, uint32_t len)
 				vlan_set_tag(m, t);
 			}
 			break;
+		case HVN_NDIS_PKTINFO_TYPE_HASHVAL:
+		case HVN_NDIS_PKTINFO_TYPE_HASHINF:
+			/* XXX m->m_pkthdr.flowid */
+			break;
 		default:
 			DPRINTF("%s: unhandled pktinfo type %u\n",
 			    device_xname(sc->sc_dev), pi->rm_type);
@@ -1859,10 +2357,18 @@ hvn_rndis_status(struct hvn_softc *sc, uint8_t *buf, uint32_t len)
 static int
 hvn_rndis_query(struct hvn_softc *sc, uint32_t oid, void *res, size_t *length)
 {
+
+	return hvn_rndis_query2(sc, oid, NULL, 0, res, length, 0);
+}
+
+static int
+hvn_rndis_query2(struct hvn_softc *sc, uint32_t oid, const void *idata,
+    size_t idlen, void *odata, size_t *odlen, size_t min_odlen)
+{
 	struct rndis_cmd *rc;
 	struct rndis_query_req *req;
 	struct rndis_query_comp *cmp;
-	size_t olength = *length;
+	size_t olength = *odlen;
 	int rv;
 
 	rc = hvn_alloc_cmd(sc);
@@ -1874,10 +2380,15 @@ hvn_rndis_query(struct hvn_softc *sc, uint32_t oid, void *res, size_t *length)
 
 	req = rc->rc_req;
 	req->rm_type = REMOTE_NDIS_QUERY_MSG;
-	req->rm_len = sizeof(*req);
+	req->rm_len = sizeof(*req) + idlen;
 	req->rm_rid = rc->rc_id;
 	req->rm_oid = oid;
 	req->rm_infobufoffset = sizeof(*req) - RNDIS_HEADER_OFFSET;
+	if (idlen > 0) {
+		KASSERT(req->rm_len <= PAGE_SIZE);
+		req->rm_infobuflen = idlen;
+		memcpy(req + 1, idata, idlen);
+	}
 
 	rc->rc_cmplen = sizeof(*cmp);
 
@@ -1894,15 +2405,16 @@ hvn_rndis_query(struct hvn_softc *sc, uint32_t oid, void *res, size_t *length)
 	cmp = (struct rndis_query_comp *)&rc->rc_cmp;
 	switch (cmp->rm_status) {
 	case RNDIS_STATUS_SUCCESS:
-		if (cmp->rm_infobuflen > olength) {
+		if (cmp->rm_infobuflen > olength ||
+		    (min_odlen > 0 && cmp->rm_infobuflen < min_odlen)) {
 			rv = EINVAL;
 			break;
 		}
-		memcpy(res, rc->rc_cmpbuf, cmp->rm_infobuflen);
-		*length = cmp->rm_infobuflen;
+		memcpy(odata, rc->rc_cmpbuf, cmp->rm_infobuflen);
+		*odlen = cmp->rm_infobuflen;
 		break;
 	default:
-		*length = 0;
+		*odlen = 0;
 		rv = EIO;
 		break;
 	}
@@ -2027,4 +2539,32 @@ hvn_rndis_detach(struct hvn_softc *sc)
 	mutex_destroy(&sc->sc_cntl_sqlck);
 	mutex_destroy(&sc->sc_cntl_cqlck);
 	mutex_destroy(&sc->sc_cntl_fqlck);
+}
+
+SYSCTL_SETUP(sysctl_hw_hvn_setup, "sysctl hw.hvn setup")
+{
+	const struct sysctlnode *rnode;
+	const struct sysctlnode *cnode;
+	int error;
+
+	error = sysctl_createv(clog, 0, NULL, &rnode,
+	    CTLFLAG_PERMANENT, CTLTYPE_NODE, "hvn",
+	    SYSCTL_DESCR("hvn global controls"),
+	    NULL, 0, NULL, 0, CTL_HW, CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+
+	error = sysctl_createv(clog, 0, &rnode, &cnode,
+	    CTLFLAG_PERMANENT|CTLFLAG_READWRITE, CTLTYPE_INT,
+	    "udp_csum_fixup_mtu",
+	    SYSCTL_DESCR("UDP checksum offloding fixup MTU"),
+	    NULL, 0, &hvn_udpcs_fixup_mtu, sizeof(hvn_udpcs_fixup_mtu),
+	    CTL_CREATE, CTL_EOL);
+	if (error)
+		goto fail;
+
+	return;
+
+fail:
+	aprint_error("%s: sysctl_createv failed (err = %d)\n", __func__, error);
 }

@@ -102,8 +102,6 @@ static char hyperv_hypercall_page[PAGE_SIZE]
 
 static u_int	hyperv_get_timecount(struct timecounter *);
 
-static u_int hyperv_ver_major;
-
 static u_int hyperv_features;		/* CPUID_HV_MSR_ */
 static u_int hyperv_recommends;
 

@@ -14,6 +14,7 @@ file	dev/hyperv/hvkbd.c		hvkbd needs-flag
 device	hvn: ether, ifnet, arp
 attach	hvn at hypervvmbus
 file	dev/hyperv/if_hvn.c		hvn
+defparam opt_if_hvn.h	HVN_UDP_CSUM_FIXUP_MTU
 
 device	hvs: scsi
 attach	hvs at hypervvmbus

@@ -201,4 +201,21 @@ struct hvn_nvs_rndis_ack {
 	uint8_t		nvs_rsvd[24];
 } __packed;
 
+/*
+ * RNDIS extension
+ */
+
+/* Per-packet hash info */
+#define HVN_NDIS_HASH_INFO_SIZE		sizeof(uint32_t)
+#define HVN_NDIS_PKTINFO_TYPE_HASHINF	NDIS_PKTINFO_TYPE_ORIG_NBLIST
+/* NDIS_HASH_ */
+
+/* Per-packet hash value */
+#define HVN_NDIS_HASH_VALUE_SIZE	sizeof(uint32_t)
+#define HVN_NDIS_PKTINFO_TYPE_HASHVAL	NDIS_PKTINFO_TYPE_PKT_CANCELID
+
+/* Per-packet-info size */
+#define HVN_RNDIS_PKTINFO_SIZE(dlen) \
+	offsetof(struct rndis_pktinfo, rm_data[dlen])
+
 #endif	/* _IF_HVNREG_H_ */

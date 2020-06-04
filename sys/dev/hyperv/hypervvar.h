@@ -59,6 +59,7 @@ __CTASSERT(sizeof(struct hyperv_reftsc) == PAGE_SIZE);
 #endif
 
 #if defined(_KERNEL)
+extern u_int hyperv_ver_major;
 
 int	hyperv_hypercall_enabled(void);
 int	hyperv_synic_supported(void);

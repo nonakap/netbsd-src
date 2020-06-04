@@ -42,6 +42,7 @@ __KERNEL_RCSID(0, "$NetBSD: hyperv_common.c,v 1.5 2019/12/10 12:20:20 nonaka Exp
 #include <dev/hyperv/hypervreg.h>
 #include <dev/hyperv/hypervvar.h>
 
+u_int hyperv_ver_major;
 hyperv_tc64_t hyperv_tc64;
 
 int		hyperv_nullop(void);
