@@ -195,6 +195,10 @@ struct btinfo_rootdevice bi_root;
 #define	devb2cdb(bno)	(((bno) * DEV_BSIZE) / ISO_DEFAULT_BLOCK_SIZE)
 #endif
 
+#if defined(EFIBOOT) && defined(SUPPORT_CD9660)
+static int check_cd9660(struct biosdisk *d, int part);
+#endif
+
 static void
 dealloc_biosdisk(struct biosdisk *d)
 {
@@ -433,7 +437,7 @@ check_gpt(struct biosdisk *d, daddr_t rf_offset, daddr_t sector)
 					d->part[j].fstype = FS_CGD;
 				else
 					d->part[j].fstype = FS_OTHER;
-#ifndef NO_GPT
+
 				for (int k = 0;
 				     k < __arraycount(gpt_parts);
 				     k++) {
@@ -448,12 +452,22 @@ check_gpt(struct biosdisk *d, daddr_t rf_offset, daddr_t sector)
 					       sizeof(ep[i].ent_name),
 					       d->part[j].part_name,
 					       BIOSDISK_PART_NAME_LEN);
-#endif
 				j++;
 			}
 		}
-
 	}
+
+#if defined(EFIBOOT) && defined(SUPPORT_CD9660)
+	if (j < BIOSDISKNPART) {
+		/* Check Hybrid ISO image. */
+		if (check_cd9660(d, j) == 0) {
+			d->part[j].attr = GPT_ENT_ATTR_BOOTME;
+			d->part[j].part_name = alloc(BIOSDISK_PART_NAME_LEN);
+			strlcpy(d->part[j].part_name, "cd9660",
+			    sizeof(BIOSDISK_PART_NAME_LEN));
+		}
+	}
+#endif
 
 	if (crc != gpth.hdr_crc_table) {
 #ifdef DISK_DEBUG	
@@ -615,14 +629,15 @@ read_minix_subp(struct biosdisk *d, struct disklabel* dflt_lbl,
 
 #if defined(EFIBOOT) && defined(SUPPORT_CD9660)
 static int
-check_cd9660(struct biosdisk *d)
+check_cd9660(struct biosdisk *d, int part)
 {
 	struct biosdisk_extinfo ed;
 	struct iso_primary_descriptor *vd;
 	daddr_t bno;
 
 	for (bno = 16;; bno++) {
-		if (readsects(&d->ll, bno, 1, d->buf, 0))
+		if (readsects(&d->ll, bno,
+		    ISO_DEFAULT_BLOCK_SIZE / d->ll.secsize, d->buf, 0))
 			return -1;
 		vd = (struct iso_primary_descriptor *)d->buf;
 		if (memcmp(vd->id, ISO_STANDARD_ID, sizeof vd->id) != 0)
@@ -638,10 +653,9 @@ check_cd9660(struct biosdisk *d)
 	if (set_geometry(&d->ll, &ed))
 		return -1;
 
-	memset(d->part, 0, sizeof(d->part));
-	d->part[0].fstype = FS_ISO9660;
-	d->part[0].offset = 0;
-	d->part[0].size = ed.totsec;
+	d->part[part].fstype = FS_ISO9660;
+	d->part[part].offset = 0;
+	d->part[part].size = ed.totsec;
 	return 0;
 }
 #endif
@@ -756,7 +770,8 @@ read_label(struct biosdisk *d, daddr_t offset)
 
 #if defined(EFIBOOT) && defined(SUPPORT_CD9660)
 	/* Check CD/DVD */
-	error = check_cd9660(d);
+	memset(d->part, 0, sizeof(d->part));
+	error = check_cd9660(d, 0);
 	if (error >= 0)
 		return error;
 #endif
