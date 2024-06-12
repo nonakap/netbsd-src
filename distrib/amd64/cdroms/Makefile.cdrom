@@ -9,6 +9,7 @@ EFIBOOTIMG=	efiboot.img
 CLEANFILES+=	${EFIBOOTIMG}
 .if ${MKREPRO_TIMESTAMP:Uno} != "no"
 MAKEFS_TIMESTAMP=-T "${MKREPRO_TIMESTAMP}"
+GPT_TIMESTAMP=-T "${MKREPRO_TIMESTAMP}"
 .endif
 
 # Need multidot for the boot loader to read kernel modules as it doesn't
@@ -56,3 +57,19 @@ image_md_pre: ${EFIBOOTIMG}
 	${MKDIR} ${MKDIRPERM} cdrom/mnt2 cdrom/targetroot
 	${INSTALL} ${COPY} ${SYSINSTDIR}/sysinstmsgs.?? cdrom/usr/share/sysinst/catalog/
 	${MKDIR} ${MKDIRPERM} cdrom/var
+
+image_md_post:
+	${RM} -f ${CDIMAGE}.tmp
+	dd if=/dev/zero bs=1m count=1 | \
+		cat ${CDIMAGE} ${EFIBOOTIMG} - > ${CDIMAGE}.tmp
+	${TOOL_GPT} ${GPT_TIMESSTAMP} ${CDIMAGE}.tmp create -p 2
+	${TOOL_GPT} ${GPT_TIMESSTAMP} ${CDIMAGE}.tmp add \
+		-b 64 -t windows -l "cd9660" \
+		-s $$(( ( $$(${TOOL_STAT} -f '%z' ${CDIMAGE}) / 512 ) - 64 ))
+	${TOOL_GPT} ${GPT_TIMESSTAMP} ${CDIMAGE}.tmp add \
+		-s 1m -t efi -l "EFI system" \
+		-b $$(( $$(${TOOL_STAT} -f '%z' ${CDIMAGE}) / 512 ))
+	${TOOL_GPT} ${GPT_TIMESTAMP} ${CDIMAGE}.tmp biosboot -i 1 \
+		-c ${DESTDIR}/usr/mdec/gptmbr.bin
+	${RM} -f ${CDIMAGE}
+	${MV} ${CDIMAGE}.tmp ${CDIMAGE}
