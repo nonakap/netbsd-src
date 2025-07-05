@@ -337,6 +337,7 @@ acpifan*	at acpi?		# ACPI Fan
 acpihed*	at acpi?		# ACPI Hardware Error Device
 acpilid*	at acpi?		# ACPI Lid Switch
 #acpipmtr*	at acpi?		# ACPI Power Meter (experimental)
+acpirndseed*	at acpi?		# ACPI random seed
 #acpismbus*	at acpi?		# ACPI SMBus CMI (experimental)
 acpitz* 	at acpi?		# ACPI Thermal Zone
 acpivga*	at acpi?		# ACPI Display Adapter

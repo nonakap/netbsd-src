@@ -387,4 +387,9 @@ device	amdgpio: gpiobus
 attach	amdgpio at acpinodebus
 file	dev/acpi/amdgpio.c		amdgpio
 
+# Microsoft Hyper-V random seed
+device	acpirndseed
+attach	acpirndseed at acpisdtbus
+file	dev/acpi/acpi_rndseed.c		acpirndseed
+
 include	"dev/acpi/wmi/files.wmi"
